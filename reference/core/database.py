@@ -42,6 +42,27 @@ FALSE_POSITIVE_STATUSES = (
 )
 ALL_STATUSES = ACTIVE_STATUSES + FALSE_POSITIVE_STATUSES
 
+# Statuses meaning "looked at and set aside". One definition, because the cost of
+# these drifting apart is silent: a finding counted as live in one place and dead in
+# another.
+SUPPRESSED_STATUSES = FALSE_POSITIVE_STATUSES + ("duplicate_merged", "reported")
+
+
+def is_suppressed(status: Any) -> bool:
+    """True when a status means the finding should not be presented as live.
+
+    Case-insensitive on purpose. `schemas.py` declares the LLM-facing vocabulary in
+    upper case (`FALSE_POSITIVE`) while this module and every filter downstream
+    compare in lower case, and `write_findings` stores whatever it is handed. A
+    finding the reviewer dismissed therefore reached the summary, the correlator and
+    the export as an active result -- measured, not theorised.
+
+    Normalising at the comparison rather than at the write keeps existing rows
+    working; rewriting stored values would need a migration and would still leave
+    any row written by an older build mismatched.
+    """
+    return str(status or "").strip().lower() in SUPPRESSED_STATUSES
+
 @contextmanager
 def _db(db_path: str, check_version: bool = True):
     # SECURITY (INV-4): every knowledge-database operation funnels through here, so this
@@ -571,7 +592,12 @@ def write_findings(db_path: str, filepath: str, findings: list, run_id: str = ""
                 line_numbers = "[]"
 
             # Graph status authority: Initial status is owned by the graph/harness or finding (default 'reported')
-            finding_status = status or finding.get("status") or "reported"
+            # Folded at the door: FindingSchema spells statuses UPPERCASE while every
+            # comparison in this file and memory.py is lowercase. A status stored in
+            # the schema's own casing was invisible to recall, unprotected from
+            # promotion, and missed by FP learning -- the same class of defect
+            # is_suppressed() was built to end, one layer further upstream.
+            finding_status = (status or finding.get("status") or "reported").strip().lower()
             raw_fp = (finding.get("filepath") or "").strip()
             is_dir_or_root = False
             if raw_fp:
@@ -669,7 +695,9 @@ def write_findings(db_path: str, filepath: str, findings: list, run_id: str = ""
             )
             existing_row = cursor.fetchone()
             if existing_row:
-                existing_status = existing_row[1]
+                # Case-folded: a legacy row dismissed as FALSE_POSITIVE must not be
+                # resurrected to `reported` just because its case predates the fold.
+                existing_status = (existing_row[1] or "").strip().lower()
                 if existing_status in ("dynamic_confirmed", "patch_verified") and finding_status in ("reported", "static_confirmed"):
                     finding_status = existing_status
                 elif existing_status in ("false_positive", "duplicate_merged", "non_viable", "sample_or_test") and finding_status in ("reported", "static_confirmed"):
@@ -781,33 +809,67 @@ def update_finding_calibration(
         """, (mantis_risk_score, impact_score, likelihood_score, priority, finding_id, run_id))
 
 def update_status(db_path: str, filepath: str, run_id: str, status: str):
-    """Update status for active candidate findings in a given run (preserving terminal/suppressed statuses and preventing downgrades)."""
+    """Update status for active candidate findings under `filepath` in a given run
+    (preserving terminal/suppressed statuses and preventing downgrades).
+
+    Scope is the CAMPAIGN, never the run: the exact file, plus the subtree when
+    the target is a directory. An earlier revision branched on os.path.isdir and
+    updated EVERY finding of the run for directory targets. In cross-functional
+    mode the campaign target IS a directory slice, so one slice entering the
+    reproducer stamped static_confirmed onto every other slice's findings --
+    including findings no reviewer had passed. isdir also answered differently
+    depending on the process CWD for relative paths. The subtree LIKE below
+    needs neither: for a file path the prefix pattern matches nothing and the
+    exact match carries it, so there is no directory test at all.
+
+    Status comparisons are case-folded on both sides. The finding schema spells
+    statuses UPPERCASE and historical rows may carry either; a terminal status
+    that stops protecting a finding because of its case silently un-dismisses it.
+    """
+    status = (status or "").strip().lower()
     with _db(db_path) as conn:
         cursor = conn.cursor()
         norm_fp = canonical_filepath(filepath, target_file=filepath)
         # Monotonic status protection: never overwrite higher-assurance statuses with static_confirmed or reported
         if status in ("reported", "static_confirmed"):
-            terminal_clause = "AND status NOT IN ('duplicate_merged', 'false_positive', 'non_viable', 'sample_or_test', 'mitigated', 'dynamic_confirmed', 'patch_verified')"
+            terminal_clause = "AND LOWER(status) NOT IN ('duplicate_merged', 'false_positive', 'non_viable', 'sample_or_test', 'mitigated', 'dynamic_confirmed', 'patch_verified')"
         elif status in ("dynamic_confirmed", "patch_verified"):
-            terminal_clause = "AND status NOT IN ('duplicate_merged', 'mitigated', 'patch_verified')"
+            terminal_clause = "AND LOWER(status) NOT IN ('duplicate_merged', 'mitigated', 'patch_verified')"
+        elif status in ("false_positive", "non_viable", "sample_or_test"):
+            # A dismissal is an OPINION. It never overwrites machine-verified
+            # evidence: INV-5 pins that dynamic proof supersedes a false_positive
+            # verdict, and the reverse direction would let one bad review erase
+            # a reproduced vulnerability.
+            terminal_clause = "AND LOWER(status) NOT IN ('duplicate_merged', 'mitigated', 'dynamic_confirmed', 'patch_verified', 'false_positive', 'non_viable', 'sample_or_test')"
         else:
-            terminal_clause = "AND status NOT IN ('duplicate_merged', 'false_positive', 'non_viable', 'sample_or_test', 'mitigated')"
+            terminal_clause = "AND LOWER(status) NOT IN ('duplicate_merged', 'false_positive', 'non_viable', 'sample_or_test', 'mitigated')"
 
-        if norm_fp and not os.path.isdir(norm_fp):
-            cursor.execute(f"""
-                UPDATE findings
-                SET status = ?
-                WHERE filepath = ?
-                  AND run_id = ?
-                  {terminal_clause}
-            """, (status, norm_fp, run_id))
-        else:
+        if not norm_fp or norm_fp in (".", "/"):
+            # Empty CAN be legitimate: canonical_filepath relativizes the tree
+            # root against itself to "", and whole-mode campaigns target the
+            # root. For those the campaign scope genuinely is the entire tree.
+            # But an empty RAW filepath is a stamp with no address, and the old
+            # behaviour -- falling through to a run-wide UPDATE -- is exactly
+            # the laundering this function no longer performs.
+            if not (filepath or "").strip():
+                return
             cursor.execute(f"""
                 UPDATE findings
                 SET status = ?
                 WHERE run_id = ?
                   {terminal_clause}
             """, (status, run_id))
+            return
+
+        base = norm_fp.rstrip("/") or norm_fp
+        escaped = base.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        cursor.execute(f"""
+            UPDATE findings
+            SET status = ?
+            WHERE run_id = ?
+              AND (filepath = ? OR filepath LIKE ? ESCAPE '\\')
+              {terminal_clause}
+        """, (status, run_id, base, escaped + "/%"))
 
         # Upgrade OKF concepts trust tier on dynamic sandbox confirmation strictly for this specific resource
         if status in ("dynamic_confirmed", "patch_verified") and norm_fp and not os.path.isdir(norm_fp):
@@ -1731,14 +1793,14 @@ def query_security_guidance(db_path: str, filepath: str, run_id: Optional[str] =
             query_fp = """
                 SELECT * FROM findings
                 WHERE filepath = ?
-                  AND status IN ('false_positive', 'non_viable', 'sample_or_test')
+                  AND LOWER(status) IN ('false_positive', 'non_viable', 'sample_or_test')
                 ORDER BY timestamp DESC, id DESC
             """
             cursor.execute(query_fp, (norm_fp,))
         else:
             query_fp = """
                 SELECT * FROM findings
-                WHERE status IN ('false_positive', 'non_viable', 'sample_or_test')
+                WHERE LOWER(status) IN ('false_positive', 'non_viable', 'sample_or_test')
                 ORDER BY timestamp DESC, id DESC
             """
             cursor.execute(query_fp)

@@ -170,6 +170,11 @@ class BudgetController:
         self.config = config or BudgetConfig()
         self.run_id = run_id
         self.accumulated_tokens = initial_tokens
+        # Usage-bearing LLM responses seen. Counted where tokens are counted, at
+        # the same granularity, so the spend ledger's llm_calls column describes
+        # the same events as its tokens column. Not a ceiling: max_llm_calls is
+        # enforced by the ADK RunConfig, this merely observes.
+        self.llm_calls = 0
         self.cached_tokens = 0
         self.fresh_tokens = initial_tokens
         self.graph_steps = initial_steps
@@ -193,6 +198,7 @@ class BudgetController:
         return f"{minutes}m {secs:02d}s"
 
     def record_tokens(self, count: int, cached_count: int = 0, cache_discount: float = 0.1) -> None:
+        self.llm_calls += 1
         """Records token consumption from an LLM call or stage with cache discounting (0.1x / 90% discount)."""
         if count <= 0:
             return

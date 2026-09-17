@@ -914,10 +914,43 @@ def _validate_safe_repo_path(path: str, jail_dir: Path) -> tuple[Optional[Path],
     return target_path_real, None
 
 
+# Default wall-clock ceiling for a single git invocation. Adequate for ordinary repos.
+#
+# Callers working at ELR scale MUST raise this rather than reaching for a raw subprocess
+# call: every hardening flag, the env allowlist, and the ceiling-dir containment live in
+# _run_safe_git_command, and a caller who bypasses it to escape the timeout silently drops
+# all of them at once. Measured: ~1.4s for 3.9k commits, while chromium and Linux carry
+# 70-90k commits/year, so a full history walk needs minutes, not seconds.
+DEFAULT_GIT_TIMEOUT = 15.0
+
+# Absolute ceiling on the caller-supplied value. The parameter exists to accommodate large
+# histories, not to let a caller hang the pipeline indefinitely.
+MAX_GIT_TIMEOUT = 900.0
+
+
+def _resolve_git_timeout(timeout: Optional[float]) -> float:
+    """Clamps a caller-supplied git timeout into [1, MAX_GIT_TIMEOUT]."""
+    if timeout is None:
+        return DEFAULT_GIT_TIMEOUT
+    try:
+        value = float(timeout)
+    except (TypeError, ValueError):
+        logger.warning("Ignoring non-numeric git timeout %r; using %.0fs.", timeout, DEFAULT_GIT_TIMEOUT)
+        return DEFAULT_GIT_TIMEOUT
+    if value <= 0:
+        logger.warning("Ignoring non-positive git timeout %r; using %.0fs.", timeout, DEFAULT_GIT_TIMEOUT)
+        return DEFAULT_GIT_TIMEOUT
+    if value > MAX_GIT_TIMEOUT:
+        logger.warning("Clamping git timeout %.0fs to ceiling %.0fs.", value, MAX_GIT_TIMEOUT)
+        return MAX_GIT_TIMEOUT
+    return max(1.0, value)
+
+
 def _run_safe_git_command(
     cmd_args: list[str],
     repo_dir: Path,
     ceiling_dir: Optional[Union[str, Path]] = None,
+    timeout: Optional[float] = None,
 ) -> tuple[str, bool]:
     """Runs a read-only git command with security flags, isolated hooks, and sanitized environment."""
     from core.llm_gateway import get_sanitized_env
@@ -973,12 +1006,13 @@ def _run_safe_git_command(
     git_env["GIT_TERMINAL_PROMPT"] = "0"
     git_env["GIT_ASKPASS"] = "/usr/bin/false"
     git_env["GIT_SSH_COMMAND"] = "/usr/bin/false"
+    effective_timeout = _resolve_git_timeout(timeout)
     try:
         res = subprocess.run(
             base_cmd + cmd_args,
             capture_output=True,
             text=True,
-            timeout=15,
+            timeout=effective_timeout,
             env=git_env,
         )
         if res.returncode != 0:
@@ -986,7 +1020,7 @@ def _run_safe_git_command(
             return err, False
         return res.stdout, True
     except subprocess.TimeoutExpired:
-        return "Error: git command timed out after 15s.", False
+        return f"Error: git command timed out after {effective_timeout:.0f}s.", False
     except (FileNotFoundError, OSError) as e:
         return f"Error executing git: {e}", False
 

@@ -128,7 +128,8 @@ A valid workflow JSON has the following top-level structure:
   * "record_exploit_chain": Link constituent findings into composite exploit chains.
   * "record_learning": Log trajectory insights into learnings journal.
   * "dedupe_findings": Deduplicate similar findings.
-  * "generate_report": Render final executive summary and SARIF reports.
+  * "generate_report": Record the final executive summary packet. (SARIF is emitted
+    separately by the run's output sink, not by this tool.)
   * "get_security_guidance": Fetch domain security standards (e.g. OWASP, CIS benchmarks).
   * "query_lineage": Query vulnerability finding history and snapshot provenance.
 - Sandbox & Dynamic Execution Tools:
@@ -279,6 +280,116 @@ DOMAIN_ARCHETYPES: Dict[str, Dict[str, Any]] = {
     },
 }
 
+# Surveyor archetypes -> DOMAIN_ARCHETYPES families.
+#
+# The two vocabularies are disjoint by design: the Surveyor names what it measured in a
+# directory (17 audit kinds), while DOMAIN_ARCHETYPES names a workflow shape (3 families
+# plus "standard"). Mapping them requires this table; inferring it from substring
+# overlap would silently misfile every archetype whose name happens to share a word.
+#
+# Anything absent maps to "standard" deliberately. An unrecognized archetype must widen
+# nothing -- a new Surveyor tag should produce the general-purpose graph, not the
+# most-capable one, until someone decides where it belongs.
+_SURVEY_ARCHETYPE_FAMILY: Dict[str, str] = {
+    "kernel_syscall_audit": "kernel",
+    "ipc_sandbox_escape": "kernel",
+    "memory_safety_audit": "kernel",
+    "web_request_handling_audit": "web_api",
+    "sql_injection_audit": "web_api",
+    "ssrf_audit": "web_api",
+    "authentication_audit": "web_api",
+    "network_protocol_audit": "web_api",
+    "authorization_audit": "cloud_iam",
+    "privilege_escalation_audit": "cloud_iam",
+}
+
+# Sandbox backends ordered by capability, per design section 5.4. Comparison is by
+# index: a request is honoured only when it does not exceed the operator's ceiling.
+#
+# seatbelt is listed because it exists as a backend and the ordering must be total to
+# compare against it; being in this tuple is not a recommendation to use it.
+SANDBOX_CAPABILITY_ORDER: tuple[str, ...] = (
+    "static-only",
+    "seatbelt",
+    "gvisor",
+    "microsandbox",
+    "gce",
+)
+
+
+def _sandbox_rank(backend: str) -> int:
+    """Position of a backend in the capability ordering.
+
+    An unknown backend sorts above every known one, so the clamp treats it as maximally
+    capable and refuses it against any ceiling. The alternative -- defaulting unknown
+    names to 0 -- would let a typo or an injected string pass the gate as though it were
+    the least-capable option.
+    """
+    normalized = "static-only" if backend in ("static", "static-only") else str(backend)
+    try:
+        return SANDBOX_CAPABILITY_ORDER.index(normalized)
+    except ValueError:
+        return len(SANDBOX_CAPABILITY_ORDER)
+
+
+def clamp_sandbox_to_ceiling(requested: str, ceiling: str) -> tuple[str, bool]:
+    """Applies the section 5.4 invariant: effective = min(request, operator ceiling).
+
+    Returns `(effective_backend, was_clamped)`.
+
+    This exists because repository-derived signals -- file names, entrypoint patterns,
+    path structure, churn -- are attacker-controlled. A hostile repository that plants
+    ioctl-shaped code in a high-churn directory scores as a kernel target, and without
+    this clamp that score would dispatch the repository's own code into a stronger
+    guest. Repo evidence may narrow capability; it may never select or expand it.
+    """
+    ceiling_norm = "static-only" if ceiling in ("static", "static-only") else str(ceiling)
+    requested_norm = "static-only" if requested in ("static", "static-only") else str(requested)
+    if _sandbox_rank(requested_norm) > _sandbox_rank(ceiling_norm):
+        return ceiling_norm, True
+    return requested_norm, False
+
+
+def meets_sandbox_floor(effective: str, floor: str) -> tuple[bool, str]:
+    """Whether `effective` is at least as containing as `floor`. Returns `(ok, reason)`.
+
+    The mirror of `clamp_sandbox_to_ceiling`, and deliberately NOT implemented with
+    `_sandbox_rank`, even though the comparison looks identical.
+
+    `_sandbox_rank` sorts an unknown backend ABOVE every known one. That is correct for
+    a ceiling: an unrecognised name must be treated as maximally capable so the clamp
+    refuses it. Reused for a floor it inverts into a hole -- a typo, or a backend name
+    injected into a config, would sort above the floor and satisfy it. Measured before
+    this function existed: with the floor at `gvisor`, the string `bogus` passed.
+
+    So unknown fails BOTH directions: too capable for a ceiling, not trusted for a
+    floor. The two questions are not the same question, and one ordering cannot answer
+    both safely.
+
+    A floor never raises the ceiling. This function only answers yes or no; the caller
+    refuses the tool rather than upgrading the sandbox, because a config file that
+    could escalate its own containment is the exact defect the ceiling prevents.
+    """
+    effective_norm = "static-only" if effective in ("static", "static-only") else str(effective)
+    floor_norm = "static-only" if floor in ("static", "static-only") else str(floor)
+
+    if floor_norm not in SANDBOX_CAPABILITY_ORDER:
+        return False, (
+            f"unknown sandbox floor {floor!r}; expected one of "
+            f"{', '.join(SANDBOX_CAPABILITY_ORDER)}"
+        )
+    if effective_norm not in SANDBOX_CAPABILITY_ORDER:
+        return False, (
+            f"unknown sandbox backend {effective!r}, so its containment cannot be "
+            f"compared against the required floor {floor_norm!r}"
+        )
+
+    if SANDBOX_CAPABILITY_ORDER.index(effective_norm) < SANDBOX_CAPABILITY_ORDER.index(floor_norm):
+        return False, (
+            f"sandbox {effective_norm!r} is below the required floor {floor_norm!r}"
+        )
+    return True, ""
+
 
 class ResearchGraphSynthesizer:
     """Synthesizes domain-tailored ADK research graph specifications from objectives.
@@ -291,13 +402,86 @@ class ResearchGraphSynthesizer:
         self.default_model = default_model
         self.db_path = db_path
 
-    def detect_domain_archetype(self, objective: str) -> str:
-        """Matches user objective against known domain archetypes or defaults to standard."""
-        lower_obj = objective.lower()
+    def detect_domain_archetype(self, objective: str, astm: Optional[dict] = None) -> str:
+        """Selects a workflow family from the objective, falling back to repo evidence.
+
+        Returns the archetype name only; callers needing to know WHERE it came from use
+        `detect_domain_archetype_with_provenance`, and any caller touching sandbox
+        capability MUST use that one -- the source determines whether the result is
+        operator-authored or attacker-influenced.
+        """
+        return self.detect_domain_archetype_with_provenance(objective, astm)[0]
+
+    def detect_domain_archetype_with_provenance(
+        self, objective: str, astm: Optional[dict] = None
+    ) -> tuple[str, str]:
+        """Selects a workflow family and reports which input chose it.
+
+        Returns `(archetype, source)` where source is "objective", "repository", or
+        "default".
+
+        The objective is checked first and wins outright. It is operator-authored, it
+        states intent that no measurement can infer -- "audit the IAM policies" on a repo
+        that is 95% frontend code is a legitimate instruction -- and preferring it keeps
+        repository influence confined to the case where the operator expressed no
+        preference at all.
+
+        The repository is consulted only when the objective names no domain, which
+        previously produced "standard" for every large codebase regardless of what was
+        in it. That fallback is the entire point of this function: an unqualified "find
+        bugs" against a kernel tree should not get the same graph as a Flask app.
+
+        SECURITY: a "repository" result is derived from attacker-controlled bytes and is
+        therefore advisory for topology only. It must not widen sandbox capability --
+        see `clamp_sandbox_to_ceiling`.
+        """
+        lower_obj = (objective or "").lower()
         for archetype, cfg in DOMAIN_ARCHETYPES.items():
             if any(kw in lower_obj for kw in cfg["keywords"]):
-                return archetype
-        return "standard"
+                return archetype, "objective"
+
+        inferred = self._archetype_from_astm(astm)
+        if inferred:
+            return inferred, "repository"
+        return "standard", "default"
+
+    @staticmethod
+    def _archetype_from_astm(astm: Optional[dict]) -> Optional[str]:
+        """Aggregates per-slice Surveyor archetypes into one workflow family.
+
+        Weighted by `risk_score` rather than counted, because the ranking is the
+        Surveyor's actual output: ten low-risk web directories should not outvote the
+        IPC layer that the survey put at the top. Ties break alphabetically so the same
+        repository always yields the same graph.
+
+        Returns None -- not "standard" -- when nothing is usable, so the caller can tell
+        "the repository said nothing" apart from "the repository said general-purpose".
+        """
+        if not isinstance(astm, dict):
+            return None
+        slices = astm.get("slices")
+        if not isinstance(slices, list):
+            return None
+
+        weights: Dict[str, float] = {}
+        for entry in slices:
+            if not isinstance(entry, dict):
+                continue
+            family = _SURVEY_ARCHETYPE_FAMILY.get(str(entry.get("domain_archetype", "")))
+            if not family:
+                continue
+            try:
+                score = float(entry.get("risk_score", 0.0))
+            except (TypeError, ValueError):
+                score = 0.0
+            # A slice that ranked but scored zero is still evidence of a kind; floor the
+            # weight so it counts once rather than vanishing.
+            weights[family] = weights.get(family, 0.0) + max(score, 0.01)
+
+        if not weights:
+            return None
+        return min(weights.items(), key=lambda kv: (-kv[1], kv[0]))[0]
+
 
     def synthesize_archetype(
         self,
@@ -305,10 +489,15 @@ class ResearchGraphSynthesizer:
         budget_config: Optional[BudgetConfig] = None,
         target_root: str = ".",
         sandbox_type: Optional[str] = None,
+        astm: Optional[dict] = None,
     ) -> WorkflowSpec:
-        """Synthesizes a complete, runnable WorkflowSpec tailored to the detected archetype."""
+        """Synthesizes a complete, runnable WorkflowSpec tailored to the detected archetype.
+
+        `astm` is the Surveyor's map of the target. It supplies the archetype when the
+        objective names no domain, and it never expands sandbox capability (section 5.4).
+        """
         domain_slug = slugify(objective)
-        archetype = self.detect_domain_archetype(objective)
+        archetype, archetype_source = self.detect_domain_archetype_with_provenance(objective, astm)
         cfg_archetype = DOMAIN_ARCHETYPES.get(archetype, {})
 
         researcher_tools = cfg_archetype.get(
@@ -323,10 +512,40 @@ class ResearchGraphSynthesizer:
             "patcher_tools",
             ["apply_patch", "run_sandbox", "run_sandbox_with_evidence", "read_file", "write_file", "get_findings", "get_security_guidance", "query_lineage"],
         )
+        # Sandbox selection, per section 5.4. An explicit operator choice is honoured
+        # unchanged. Otherwise the archetype's preferred backend is a REQUEST, and what
+        # it is clamped against depends on where the archetype came from:
+        #
+        #   objective  -- operator-authored text, so today's behaviour is preserved
+        #                 exactly and the archetype's backend stands (INV-6).
+        #   repository -- derived from repository bytes an attacker may control, so the
+        #                 ceiling is static-only: a planted ioctl-shaped directory can
+        #                 shape the graph's topology but cannot buy itself a guest to
+        #                 run in.
+        sandbox_clamp: Optional[dict] = None
         if sandbox_type:
             final_sandbox_type = "static-only" if sandbox_type in ("static-only", "static") else sandbox_type
         else:
-            final_sandbox_type = cfg_archetype.get("sandbox_type", "static-only")
+            requested = cfg_archetype.get("sandbox_type", "static-only")
+            if archetype_source == "repository":
+                final_sandbox_type, was_clamped = clamp_sandbox_to_ceiling(requested, "static-only")
+                if was_clamped:
+                    # Recorded, not merely logged: a capability clamp is a security
+                    # event and has to survive into the run's artifacts (section 12.3).
+                    sandbox_clamp = {
+                        "requested": requested,
+                        "effective": final_sandbox_type,
+                        "ceiling": "static-only",
+                        "reason": "archetype inferred from repository content, which cannot expand capability",
+                    }
+                    logger.warning(
+                        "[SYNTHESIZER SECURITY GATE] Repository-derived archetype '%s' requested "
+                        "sandbox '%s'; clamped to '%s'.",
+                        archetype, requested, final_sandbox_type,
+                    )
+            else:
+                final_sandbox_type = requested
+
 
         if final_sandbox_type == "static-only":
             researcher_tools = [t for t in researcher_tools if t not in ("run_sandbox", "run_sandbox_with_evidence")]
@@ -441,10 +660,17 @@ class ResearchGraphSynthesizer:
         metadata = {
             "domain": domain_slug,
             "archetype": archetype,
+            # Which input chose the archetype. Without this the reader of a recipe
+            # cannot tell an operator's stated intent from an inference drawn off
+            # repository content, and those two carry different trust.
+            "archetype_source": archetype_source,
             "objective": objective,
             "synthesis_mode": "deterministic_archetype",
             "created_at": timestamp,
         }
+        if sandbox_clamp:
+            metadata["sandbox_clamp"] = sandbox_clamp
+
 
         spec_dict = {
             "name": f"workflow_{domain_slug}",
@@ -885,6 +1111,7 @@ class ResearchGraphSynthesizer:
         model: Optional[str] = None,
         timeout: Optional[float] = None,
         max_repair_attempts: int = 3,
+        astm: Optional[dict] = None,
     ) -> WorkflowSpec:
         """Synthesizes a specialized research graph using an LLM, backed by multi-turn compiler feedback."""
         chosen_model = model or self.default_model
@@ -966,6 +1193,7 @@ class ResearchGraphSynthesizer:
                 budget_config=budget_config,
                 target_root=target_root,
                 sandbox_type=sandbox_type,
+                astm=astm,
             )
 
     def synthesize(
@@ -977,6 +1205,7 @@ class ResearchGraphSynthesizer:
         use_llm: bool = False,
         model: Optional[str] = None,
         timeout: Optional[float] = None,
+        astm: Optional[dict] = None,
     ) -> WorkflowSpec:
         """Synthesizes a complete, runnable WorkflowSpec tailored to the given objective."""
         if use_llm:
@@ -987,12 +1216,14 @@ class ResearchGraphSynthesizer:
                 sandbox_type=sandbox_type,
                 model=model,
                 timeout=timeout,
+                astm=astm,
             )
         return self.synthesize_archetype(
             objective=objective,
             budget_config=budget_config,
             target_root=target_root,
             sandbox_type=sandbox_type,
+            astm=astm,
         )
 
     @staticmethod

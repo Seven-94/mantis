@@ -57,6 +57,11 @@ async def execute_sub_task(
     status_map: dict[str, str] | None = None,
     seed_prompt_template: str = DEFAULT_SEED_PROMPT,
     budget_controller: Optional[BudgetController] = None,
+    slice_briefing: str = "",
+    focus_directive: str = "",
+    prior_memory: str = "",
+    coverage_note: str = "",
+    hypotheses: str = "",
 ) -> bool:
     """Executes the workflow graph for a single target file. Returns True if an error was encountered."""
     sanitized_filepath = str(filepath).replace("\n", "").replace("\r", "").strip()
@@ -109,6 +114,33 @@ async def execute_sub_task(
             .replace("{filepath}", str(sanitized_filepath))
             .replace("{run_id}", str(run_id))
         )
+        # Appended AFTER substitution, deliberately. The briefing is built from
+        # repository bytes, and a directory named "{filepath}" would otherwise be
+        # substituted into rather than merely quoted. Concatenating afterwards means
+        # repo content is never on the template side of an expansion.
+        if slice_briefing:
+            query_text += slice_briefing
+        # Prior-run evidence. Like the briefing it is LLM-written text carrying its own
+        # CP-4 fencing, so it sits with the briefing on the data side of the prompt,
+        # ahead of the operator instruction below.
+        if prior_memory:
+            query_text += prior_memory
+        # Cross-area leads. Derived mechanically from earlier findings' symbols and
+        # weakness classes, but the subject matter still originates in LLM output, so
+        # this carries its own CP-4 fencing and belongs on the data side too.
+        if hypotheses:
+            query_text += hypotheses
+        # The focus directive and the coverage note are operator-authored text chosen by
+        # a repository-derived key, so unlike the briefing they are not fenced as
+        # untrusted. They go LAST so they are not enclosed by the briefing's
+        # untrusted-data delimiters: inside them they would read as content the agent has
+        # been told to distrust, which is the opposite of an instruction. Same
+        # literal-concatenation rule as above.
+        if coverage_note:
+            query_text += coverage_note
+        if focus_directive:
+            query_text += focus_directive
+
         new_message = types.Content(
             parts=[types.Part.from_text(text=query_text)],
             role="user"
@@ -324,6 +356,412 @@ def discover_files(target: Path, db_path: str = "") -> list[str]:
         if p.is_file() and not p.is_symlink() and str(p) != db_path and not any(part.startswith(".") for part in p.parts) and not is_binary_file(p)
     ]
 
+
+# How many ranked slices become campaigns when slicing engages.
+#
+# A cost/coverage tradeoff with no measured basis yet: each slice is a full graph run,
+# so this multiplies the cost of a repository scan by up to this factor. The budget
+# controller still bounds the total and pauses rather than overrunning, so the practical
+# effect is breadth-first versus depth-first on the same budget. Which value actually
+# maximizes findings per dollar is an M6 benchmark question, not something to guess at
+# here -- hence the config override.
+DEFAULT_SCAN_SLICES = 10
+
+# Scan modes. These are COMPLEMENTARY, not a quality ladder -- each answers a different
+# question, and picking the wrong one loses real bugs rather than merely costing time.
+#
+# The names describe COVERAGE and REACH, which vary independently, and deliberately
+# avoid "breadth"/"depth": those read as a quality ladder, and the earlier naming
+# called the narrow mode the "depth mode", which implied it was the thorough option
+# when it is the one that looks at LESS of the repository.
+#
+#   whole            One campaign over the whole target. The agent orients itself
+#                    through list_files and reads what it judges relevant. Cheapest;
+#                    the historical default for a directory target.
+#
+#   file-by-file     One campaign per source file: point a researcher at every file in
+#                    turn and ask what is wrong with THIS file, then dedupe and strip
+#                    false positives downstream. Exhaustive coverage, local reach. It
+#                    is how localized bugs -- the bad memcpy, the unchecked index, the
+#                    missing authz call -- get found reliably, because no file is
+#                    skipped for being unglamorous. Cost scales with file count.
+#
+#   cross-functional One campaign per ranked subsystem from the Surveyor. Selective
+#                    coverage, compositional reach: defects that span many files,
+#                    several repositories or whole systems are invisible to a
+#                    file-by-file pass by construction, because no single file
+#                    contains the bug. This is the only mode the workflow synthesizer
+#                    has anything to work with.
+#
+# A cross-functional scan is therefore NOT a better version of a whole-repository scan,
+# and an earlier revision of this function was wrong to frame it as the thing you do
+# once the whole-repository view "breaks". The two modes find different defects.
+#
+# Both orderings are supported deliberately. Running file-by-file first gives the
+# cross-functional pass real evidence to plan from; running cross-functional alone is
+# a legitimate choice when the operator wants to go straight at composite defects, or
+# wants to re-plan against findings an earlier run already stored.
+SCAN_MODE_AUTO = "auto"
+SCAN_MODE_WHOLE = "whole"
+SCAN_MODE_FILE_BY_FILE = "file-by-file"
+SCAN_MODE_CROSS_FUNCTIONAL = "cross-functional"
+
+# Superseded spellings. Accepted forever on input so existing workflow.json files and
+# saved recipes keep working (INV-6), but never emitted.
+_SCAN_MODE_ALIASES = {
+    "file-sweep": SCAN_MODE_FILE_BY_FILE,
+    "file_sweep": SCAN_MODE_FILE_BY_FILE,
+    "slices": SCAN_MODE_CROSS_FUNCTIONAL,
+}
+
+_SCAN_MODES = (
+    SCAN_MODE_AUTO,
+    SCAN_MODE_WHOLE,
+    SCAN_MODE_FILE_BY_FILE,
+    SCAN_MODE_CROSS_FUNCTIONAL,
+)
+
+
+def normalize_scan_mode(value: Any) -> str:
+    """Maps a configured scan mode onto its current spelling.
+
+    Unknown values are returned as-is so the caller can report them; this function
+    deliberately does not validate, because the caller already prints a helpful
+    message naming the valid modes.
+    """
+    text = str(value or "").strip().lower()
+    return _SCAN_MODE_ALIASES.get(text, text)
+
+
+# Campaign count above which an interactive operator is asked to confirm. This IS an
+# arbitrary constant, and unlike the correlator's stopword list that is acceptable here
+# because of the asymmetry in what being wrong costs: a badly chosen threshold costs one
+# extra keystroke, or one prompt not shown, and never changes what the scan finds. A
+# badly chosen analysis constant silently destroys results. Only the second kind has to
+# be derived from the corpus.
+_CONFIRM_CAMPAIGN_FLOOR = 50
+
+
+def _confirm_work_plan(
+    scan_mode: str,
+    campaigns: int,
+    budget: Optional[BudgetConfig],
+    assume_yes: bool = False,
+    stream: Any = None,
+    estimate: Any = None,
+) -> bool:
+    """States the size of the work plan, and asks before committing to a large one.
+
+    Returns True to proceed. Never raises.
+
+    The plan line is printed ALWAYS, including non-interactively: the operator should
+    be able to read what a run committed to from a CI log afterwards. Only the question
+    is conditional.
+
+    Tone is fixed by a standing rule: state the numbers, never judge them. No "are you
+    sure", no warning language, no discouragement, no cap. The operator chooses.
+    """
+    out = stream if stream is not None else sys.stderr
+
+    max_calls = 0
+    if budget is not None:
+        try:
+            max_calls = int(getattr(budget, "max_llm_calls", 0) or 0)
+        except (TypeError, ValueError):
+            max_calls = 0
+
+    # max_llm_calls is enforced PER CAMPAIGN -- it is handed to each ADK RunConfig
+    # separately -- so it does NOT bound a multi-campaign run and must not be rendered as
+    # if it did. Saying "2,000 call limit" next to "462,079 campaigns" would read as a
+    # total and understate the run by five orders of magnitude. The ceilings that
+    # actually stop a long run are wall-clock and tokens.
+    plan = f"{scan_mode}: {campaigns} campaign(s)"
+    if max_calls > 0:
+        plan += f", up to {max_calls} LLM call(s) each"
+    print(f"\n📋 Work plan — {plan}.", file=out)
+
+    # What the token budget actually buys. Printed unconditionally, like the plan
+    # line and for the same reason: the coverage a run achieved should be readable
+    # from a CI log afterwards. This states a number and never withholds a scan --
+    # an operator who asked for 462,079 campaigns gets 462,079 campaigns.
+    if estimate is not None:
+        try:
+            print(f"   {estimate.describe()}", file=out)
+            if estimate.oversized:
+                shown = ", ".join(os.path.basename(f) for f in estimate.oversized[:3])
+                more = f" (+{len(estimate.oversized) - 3} more)" if len(estimate.oversized) > 3 else ""
+                print(
+                    f"   Large enough to dominate their own campaign: {shown}{more}.",
+                    file=out,
+                )
+        except Exception:
+            # An estimate that cannot render is not a reason to block the run.
+            pass
+
+    if assume_yes or campaigns < _CONFIRM_CAMPAIGN_FLOOR:
+        return True
+
+    # Non-interactive runs MUST NOT block. CI, nohup and schedulers have no terminal to
+    # answer a prompt, and a confirmation that deadlocks an automated pipeline is a
+    # worse defect than the cost surprise it prevents. The plan line above already
+    # disclosed the size; proceed.
+    try:
+        interactive = bool(sys.stdin is not None and sys.stdin.isatty())
+    except Exception:
+        interactive = False
+    if not interactive:
+        return True
+
+    wall_hours = 0.0
+    if budget is not None:
+        try:
+            wall_hours = float(getattr(budget, "max_wall_clock_seconds", 0.0) or 0.0) / 3600.0
+        except (TypeError, ValueError):
+            wall_hours = 0.0
+    if wall_hours > 0:
+        print(
+            f"   Wall-clock ceiling is {wall_hours:.1f}h; the run pauses there and is "
+            f"resumable with --resume.",
+            file=out,
+        )
+    print("   [y] proceed   [n] abort", file=out)
+    try:
+        answer = input("   > ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        # stdin claimed to be a TTY and then went away. Fail CLOSED here, unlike the
+        # non-interactive path above: that path never offered a choice, while this one
+        # did and did not get an answer, so proceeding would act on consent nobody gave.
+        print("\n   No response; aborting.", file=out)
+        return False
+    return answer in ("y", "yes")
+
+
+def resolve_scan_targets(
+    target_path: Path,
+    config: dict,
+    discovered_files: list[str],
+    precomputed_astm: Optional[dict] = None,
+    *,
+    token_budget: int = 0,
+    db_path: str = "",
+) -> tuple[list[str], Optional[dict], str]:
+    """Chooses what the campaign scans. Returns `(targets, astm, mode)`.
+
+    `astm` is the Surveyor's map, present only in slice mode. `mode` is the resolved
+    scan mode, which the caller reports so the operator can see which question this run
+    is actually answering.
+
+    `token_budget` and `db_path` size the slice count in `auto` mode -- see below.
+    Both are optional: without them the function behaves exactly as it did before.
+
+    `precomputed_astm` is an already-computed map for this same target. Workflow
+    synthesis needs the map too, and it runs before the pipeline; surveying chromium
+    costs 65 seconds, so doing it in both places would pay that twice for one answer.
+    The caller that surveyed first passes its result in.
+
+    Mode selection is explicit via `config["scan_mode"]`; see the constants above for
+    what each one is FOR. `auto` deliberately preserves the historical behaviour --
+    whole-target for anything that fits in one listing, slices past that -- because
+    switching a repository to a per-file sweep multiplies its cost by the file count and
+    is not a decision to make on the operator's behalf.
+
+    Never raises. Every failure path falls back to the whole target: reconnaissance that
+    cannot run must not cost the operator the scan.
+    """
+    # Imported here rather than at module scope: `core.surveyor` pulls in the staging
+    # and path chokepoints, and main.py is imported by tooling that must not pay for
+    # that. Matches how validate_scan_target is already used below.
+    from core.paths import validate_scan_target
+    from core.surveyor import survey
+    from tools.research_tools import MAX_LIST_ENTRIES
+
+    whole = ([str(target_path)], None, SCAN_MODE_WHOLE)
+
+    if target_path.is_file():
+        return whole
+
+    surveyor_cfg = config.get("surveyor") or {}
+    try:
+        threshold = int(surveyor_cfg.get("min_source_files", MAX_LIST_ENTRIES))
+        max_slices = int(surveyor_cfg.get("max_slices", DEFAULT_SCAN_SLICES))
+    except (TypeError, ValueError):
+        threshold, max_slices = MAX_LIST_ENTRIES, DEFAULT_SCAN_SLICES
+
+    # Normalize first: superseded spellings ("file-sweep", "slices") must keep working,
+    # so an existing workflow.json does not start failing validation on upgrade (INV-6).
+    mode = normalize_scan_mode(config.get("scan_mode", SCAN_MODE_AUTO) or SCAN_MODE_AUTO)
+    if mode not in _SCAN_MODES:
+        print(
+            f"Unknown scan_mode {mode!r}; expected one of {', '.join(_SCAN_MODES)}. "
+            f"Falling back to {SCAN_MODE_AUTO}.",
+            file=sys.stderr,
+        )
+        mode = SCAN_MODE_AUTO
+
+    # Retained for backward compatibility: surveyor.enabled=false predates scan_mode and
+    # meant "do not split the repository into subsystems".
+    if not surveyor_cfg.get("enabled", True) and mode in (SCAN_MODE_AUTO, SCAN_MODE_CROSS_FUNCTIONAL):
+        return whole
+
+    if mode == SCAN_MODE_AUTO:
+        # `auto` chooses whole-target when the repository fits in a single campaign.
+        # Past that, the choice is driven by COVERAGE, which the spend ledger
+        # knows file by file:
+        #
+        #   - Any file no recorded campaign has ever covered: file-by-file, over
+        #     exactly those files. A first scan sweeps everything; a repository
+        #     whose `lib/` was scanned last month sweeps everything EXCEPT `lib/`.
+        #     Skipping the gap silently is the failure this exists to prevent --
+        #     treating "any history at all" as seen would send a partially
+        #     scanned repository to a cross-functional pass that reads a handful
+        #     of ranked subsystems, with nothing in the output saying what was
+        #     never looked at. This is the one case where auto selects the
+        #     per-file sweep on its own; the work-plan confirmation gate still
+        #     shows the campaign count before a large run starts. A side effect
+        #     worth having: an interrupted sweep resumes where it left off,
+        #     because every completed campaign recorded its file as covered.
+        #   - Full coverage (or no readable ledger to ask): cross-functional,
+        #     exactly as before. An unreadable ledger deliberately reads as
+        #     covered, because a corrupt database must never be the reason a run
+        #     becomes orders of magnitude larger than the operator expected.
+        #
+        # Either way it states what it selected, what that leaves unexamined, and
+        # what the alternative costs, in numbers.
+        if len(discovered_files) <= threshold:
+            mode = SCAN_MODE_WHOLE
+        else:
+            uncovered = None
+            try:
+                from core.cost import uncovered_files
+
+                uncovered = uncovered_files(db_path, discovered_files)
+            except Exception as exc:
+                print(f"[LEDGER WARNING] {exc}", file=sys.stderr)
+            if uncovered:
+                mode = SCAN_MODE_FILE_BY_FILE
+                print(
+                    f"{len(uncovered)} of {len(discovered_files)} source files have "
+                    f"never been covered by a recorded campaign: defaulting to "
+                    f"{SCAN_MODE_FILE_BY_FILE} over the uncovered files -- "
+                    f"{len(uncovered)} campaigns, one per file. Once every file has "
+                    f"history, auto selects {SCAN_MODE_CROSS_FUNCTIONAL}, which "
+                    f"plans from it. Pass --scan-mode to override.",
+                    file=sys.stderr,
+                )
+                discovered_files = list(uncovered)
+            else:
+                mode = SCAN_MODE_CROSS_FUNCTIONAL
+                # Size the slice count to the budget instead of the fixed default.
+                #
+                # This is the ONLY place the cost model chooses anything, and it is
+                # confined here deliberately: `auto` is already defined as the mode
+                # that decides on the operator's behalf, so refining ITS choice with
+                # better information changes nothing about who is in control. Every
+                # explicit mode below runs exactly what was asked for, however many
+                # campaigns that is, and merely states what the budget covers.
+                #
+                # Only ever LOWERS the count, and never below one. Raising it would
+                # turn a cost estimate -- a number we have already established is
+                # mostly a guess until a deployment has run once -- into a reason to
+                # spend more than the operator's configuration asked for.
+                if token_budget > 0:
+                    try:
+                        from core.cost import estimate_scan
+
+                        afford = estimate_scan(
+                            [], token_budget, db_path=db_path,
+                            scan_mode=SCAN_MODE_CROSS_FUNCTIONAL,
+                        ).affordable_campaigns
+                        if 0 < afford < max_slices:
+                            print(
+                                f"Budget covers ~{afford} campaign(s); surveying the top "
+                                f"{afford} subsystem(s) rather than {max_slices}.",
+                                file=sys.stderr,
+                            )
+                            max_slices = max(1, afford)
+                    except Exception as exc:
+                        # An unusable estimate leaves the configured default in place.
+                        print(f"[COST ESTIMATE WARNING] {exc}", file=sys.stderr)
+                print(
+                    f"{len(discovered_files)} source files exceeds the {threshold}-file "
+                    f"single-campaign limit; scanning the top {max_slices} ranked subsystems. "
+                    f"Most files will not be opened directly. "
+                    f"For exhaustive per-file coverage set scan_mode={SCAN_MODE_FILE_BY_FILE} "
+                    f"({len(discovered_files)} campaigns, one per file).",
+                    file=sys.stderr,
+                )
+
+    if mode == SCAN_MODE_WHOLE:
+        return whole
+
+    if mode == SCAN_MODE_FILE_BY_FILE:
+        # discover_files already produced this list and, until now, nothing consumed it:
+        # its result drove only a non-empty check and a printed count.
+        if not discovered_files:
+            return whole
+        # State the scale in numbers and stop there. A million-file scan is a rounding
+        # error to one operator and impossible for another, and this function knows
+        # nothing about which one it is talking to -- so it reports the campaign count
+        # and lets them decide. No refusal, no cap, no nudge. The budget controller
+        # still enforces the configured ceiling and pauses resumably, so an overrun
+        # costs a pause the operator can resume, not a surprise invoice.
+        print(
+            f"Scan mode {SCAN_MODE_FILE_BY_FILE}: {len(discovered_files)} campaigns, "
+            f"one per source file.",
+            file=sys.stderr,
+        )
+        return list(discovered_files), None, SCAN_MODE_FILE_BY_FILE
+
+
+    if precomputed_astm is not None:
+        astm = precomputed_astm
+    else:
+        try:
+            astm = survey(str(target_path), max_slices=max_slices)
+        except Exception as exc:
+            # Degrade, never abort. A whole-target scan is a different question, not a
+            # broken one, so falling back to it costs depth rather than the run.
+            print(
+                f"Surveyor unavailable ({exc}); scanning the repository as a single unit.",
+                file=sys.stderr,
+            )
+            return whole
+
+    # Resolve the containment base through CP-3 as well, so both sides of the comparison
+    # below are canonical. validate_scan_target returns a fully resolved path, and on
+    # macOS /var resolves to /private/var -- comparing a resolved slice against an
+    # unresolved base made every slice fail containment and silently fall back to a
+    # whole-repository scan. Any symlinked path component would have done the same.
+    base, _base_err = validate_scan_target(str(target_path))
+    if base is None:
+        return whole
+
+    targets: list[str] = []
+    seen: set[str] = set()
+    for slice_spec in astm.get("slices", []):
+        for rel in slice_spec.get("root_paths", []):
+            if rel in (".", ""):
+                continue
+            # Slice roots are derived from repository content, so they are re-validated
+            # through CP-3 and re-checked for containment rather than trusted because
+            # the Surveyor produced them.
+            resolved, _err = validate_scan_target(str(base / rel))
+            if resolved is None:
+                continue
+            try:
+                resolved.relative_to(base)
+            except ValueError:
+                continue
+            key = str(resolved)
+            if key not in seen:
+                seen.add(key)
+                targets.append(key)
+
+    if not targets:
+        return whole
+    return targets, astm, SCAN_MODE_CROSS_FUNCTIONAL
+
+
 async def pipeline(
     scan_target: str,
     workflow_path: str = "",
@@ -342,6 +780,9 @@ async def pipeline(
     enable_context_cache: Optional[bool] = None,
     max_llm_calls_override: Optional[int] = None,
     max_node_tool_calls_override: Optional[int] = None,
+    precomputed_astm: Optional[dict] = None,
+    scan_mode_override: Optional[str] = None,
+    assume_yes: bool = False,
 ):
     """Main pipeline loop compiled declaratively from JSON specification."""
     if not workflow_path:
@@ -427,13 +868,214 @@ async def pipeline(
     # Target isolation: host target is treated as strictly read-only.
     # Mutations occur only in isolated guest sandboxes or under workspace/.
     snapshot_id = config.get("kb_snapshot_id") or ""
-    if target_path.is_file():
-        targets_to_scan = [str(target_path)]
-        jail_dir = str(target_path.parent)
-    else:
-        # Repository scope: execute unified campaign across entire repository
-        targets_to_scan = [str(target_path)]
-        jail_dir = str(target_path)
+    # The jail stays the repository root even when scanning a slice: git history is a
+    # whole-repository fact, and a slice-sized jail would make it unavailable.
+    jail_dir = str(target_path.parent) if target_path.is_file() else str(target_path)
+    # An explicit --scan-mode beats workflow config. Copied rather than mutated in place:
+    # `config` is the loaded workflow and is written back out in places, and a CLI flag
+    # for one run must not rewrite the operator's file.
+    if scan_mode_override:
+        config = {**config, "scan_mode": normalize_scan_mode(scan_mode_override)}
+    targets_to_scan, astm, scan_mode = resolve_scan_targets(
+        target_path,
+        config,
+        discovered_files,
+        precomputed_astm=precomputed_astm,
+        token_budget=resolved_budget.max_tokens,
+        db_path=db_path,
+    )
+
+    # Price the plan we ended up with. Never fatal: an estimate is an aid to the
+    # operator's decision, and failing to produce one must not stop the scan.
+    scan_estimate = None
+    try:
+        from core.cost import estimate_scan
+
+        scan_estimate = estimate_scan(
+            targets_to_scan,
+            resolved_budget.max_tokens,
+            db_path=db_path,
+            scan_mode=scan_mode,
+        )
+    except Exception as exc:
+        print(f"[COST ESTIMATE WARNING] {exc}", file=sys.stderr)
+
+    # Work-plan confirmation. Deliberately placed after target resolution, because the
+    # campaign count is the number the operator actually needs, and before any campaign
+    # runs, because afterwards it is no longer a choice.
+    if not _confirm_work_plan(
+        scan_mode=scan_mode,
+        campaigns=len(targets_to_scan),
+        budget=resolved_budget,
+        assume_yes=assume_yes,
+        estimate=scan_estimate,
+    ):
+        print("Aborted before any campaign ran; nothing was scanned.")
+        return 0
+
+    # File the ranked map, and compare it against the last one taken of this target.
+    # Load BEFORE storing: storing first would overwrite the row we are about to read
+    # whenever the code has not changed, and every run would report "nothing to compare".
+    survey_diff = {"available": False}
+    if astm is not None:
+        try:
+            from core.surveyor import diff_surveys, load_latest_survey, store_survey
+
+            previous = load_latest_survey(db_path, str(target_path))
+            survey_diff = diff_surveys(previous, astm)
+            store_survey(db_path, run_id, str(target_path), astm)
+        except Exception as exc:
+            # Persistence is an enhancement to the NEXT run. It must never cost this one.
+            print(f"[SURVEY PERSISTENCE WARNING] {exc}", file=sys.stderr)
+
+    # Decide what to examine FIRST, given what earlier runs already examined.
+    #
+    # The Surveyor's ranking is memoryless: it produces the same order on the tenth
+    # audit as on the first, so a repository audited repeatedly re-walks its top-ranked
+    # ground while areas nobody ever opened stay unopened. The planner joins the ledger
+    # of what was examined, the diff of what changed, and what was confirmed, and moves
+    # unknown and changed ground to the front.
+    #
+    # It only ever REORDERS. `plan_coverage` enforces that its output is a permutation
+    # of the list it was given, so the set of paths scanned stays exactly the CP-3
+    # validated set `resolve_scan_targets` produced. Repo-derived and prior-LLM data may
+    # direct attention here; it can never introduce a target or widen anything.
+    coverage_plan = {"available": False}
+    try:
+        from core.memory import load_coverage, recall
+        from core.planner import plan_coverage, summarize_plan
+
+        coverage_plan = plan_coverage(
+            targets_to_scan,
+            coverage=load_coverage(db_path, str(target_path)),
+            survey_diff=survey_diff,
+            memory=recall(db_path, target=str(target_path)),
+        )
+        if coverage_plan.get("available"):
+            targets_to_scan = coverage_plan["order"]
+            summary = summarize_plan(coverage_plan)
+            if summary:
+                # Band counts only: no repository-derived bytes, so print not cprint.
+                print(f"\n🧭 {summary}")
+    except Exception as exc:
+        # Planning is an optimization of ORDER. Losing it costs prioritization, never
+        # the scan: the Surveyor's ranking remains a perfectly good order.
+        print(f"[COVERAGE PLAN WARNING] {exc}", file=sys.stderr)
+
+    # Name what was consulted, and what each source was permitted to conclude.
+    #
+    # With no configuration this is a single line for the local checkout. It is printed
+    # anyway: the moment a second source exists, the operator needs to already be
+    # reading a list, rather than discovering that the inputs widened silently at some
+    # point in the past.
+    #
+    # Unlike the surrounding degradations, a bad source configuration ABORTS. Coverage
+    # planning and correlation can be lost without changing what a finding means, so
+    # they warn and continue. Evidence cannot: a run that quietly drops a source the
+    # operator configured reports on less than they think it did, and looks identical
+    # to one that had everything.
+    from core.evidence import build_evidence_sources, describe_sources
+
+    try:
+        evidence_sources = build_evidence_sources(config, str(target_path))
+    except Exception as exc:
+        print(f"[EVIDENCE ERROR] {exc}", file=sys.stderr)
+        return 1
+    for line in describe_sources(evidence_sources):
+        print(f"   📚 {line}")
+
+
+    if scan_mode == SCAN_MODE_FILE_BY_FILE:
+        print(
+            f"\n🔍 Scan mode: {SCAN_MODE_FILE_BY_FILE} — one campaign per file across "
+            f"{len(targets_to_scan)} source file(s). Findings are deduplicated downstream."
+        )
+    elif astm is not None:
+        provenance = astm.get("provenance", {})
+        print(
+            f"\n🗺️  Scan mode: {SCAN_MODE_CROSS_FUNCTIONAL} — "
+            f"{provenance.get('groups_considered', 0)} candidate areas "
+            f"ranked in {provenance.get('elapsed_seconds', 0)}s; scanning top {len(targets_to_scan)}. "
+            f"Cross-file and cross-system defects are the target here; for exhaustive "
+            f"per-file coverage use scan_mode={SCAN_MODE_FILE_BY_FILE}."
+        )
+        # How this target has changed since the last audit. Only printed when there was
+        # a previous one -- on a first run there is nothing to say, and saying "no
+        # changes" would be a lie rather than a silence.
+        if survey_diff.get("available"):
+            if survey_diff.get("unchanged_snapshot"):
+                print(
+                    "    Same commit as the last audit of this target: any new finding "
+                    "comes from deeper examination, not from changed code."
+                )
+            else:
+                print(
+                    f"    Changed since the last audit "
+                    f"({survey_diff.get('previous_snapshot', '?')[:19]} → "
+                    f"{survey_diff.get('current_snapshot', '?')[:19]})."
+                )
+            # Area names are repository paths -> cprint, not print.
+            if survey_diff.get("new_areas"):
+                cprint(
+                    "    Areas not present at the last audit: "
+                    + ", ".join(survey_diff["new_areas"][:6])
+                )
+            if survey_diff.get("moved"):
+                cprint(
+                    "    Biggest rank moves: "
+                    + ", ".join(
+                        f"{m['root']} #{m['was']}→#{m['now']}"
+                        for m in survey_diff["moved"][:4]
+                    )
+                )
+        if provenance.get("inactive_signals"):
+            print(
+                f"    Signals that could not separate areas in this repository: "
+                f"{', '.join(provenance['inactive_signals'])} "
+                f"(weight redistributed to the rest)."
+            )
+        # What the survey could not see. Printed unconditionally rather than only when
+        # something looks wrong: the operator is the only person who can tell whether a
+        # language we skipped is the one their bugs live in, and they cannot tell that
+        # from a ranking that looks confident either way.
+        cov = provenance.get("coverage") or {}
+        if cov.get("files_opened"):
+            # Extensions are repository-controlled text -> cprint, not print.
+            cprint(
+                f"    Recognized security-relevant code in {cov['pattern_match_rate']:.0%} "
+                f"of the {cov['files_opened']} files opened; "
+                f"{cov.get('scannable_share', 0):.0%} of the repository is in a language "
+                f"this survey reads at all."
+            )
+            if cov.get("attack_surface_weak"):
+                cprint(
+                    "    Attack-surface matching was weak here, so the ranking rests "
+                    "mostly on churn, boundaries and language. Treat the order as a "
+                    "starting point, not a verdict."
+                )
+            unopened = cov.get("unopened_languages") or []
+            if unopened:
+                cprint(
+                    "    Never opened (extension not recognized as source): "
+                    + ", ".join(
+                        f"{item['ext']} {item['share']:.0%}" for item in unopened
+                    )
+                )
+            unrecognized = cov.get("unrecognized_languages") or []
+            if unrecognized:
+                cprint(
+                    "    Opened but matched few known idioms: "
+                    + ", ".join(
+                        f"{item['ext']} {item['rate']:.0%} of {item['opened']}"
+                        for item in unrecognized
+                    )
+                )
+        for slice_spec in astm.get("slices", [])[: len(targets_to_scan)]:
+            # Slice roots come from repository paths, so they are untrusted console output.
+            cprint(
+                f"    {slice_spec.get('priority'):>2}. {slice_spec.get('root_paths', ['?'])[0]} "
+                f"(risk {slice_spec.get('risk_score')}, {slice_spec.get('domain_archetype')})"
+            )
 
     if resume_run_id:
         existing_findings = read_findings(db_path, run_id=run_id)
@@ -503,11 +1145,80 @@ async def pipeline(
     failures = 0
     successes = 0
     paused = False
+    # Areas whose campaign ran to completion, for the coverage ledger. Appended to only
+    # on the success path below, so the ledger records what was examined rather than
+    # what was attempted.
+    examined_areas: list[str] = []
     try:
         for scan_item in targets_to_scan:
             sandbox = build_sandbox(config.get("sandbox", {}), scan_item)
             branch_ctx = dataclasses.replace(base_ctx, target_file=scan_item, sandbox=sandbox)
             current_run_context.set(branch_ctx)
+            # Tell this campaign what the survey found here and which sibling areas are
+            # also being examined. Without it a slice agent cannot know why it was sent
+            # to this directory, or that the other end of a cross-subsystem defect is
+            # somewhere it was never shown. Empty for non-slice runs.
+            briefing = ""
+            focus = ""
+            if astm is not None:
+                try:
+                    from core.surveyor import render_focus_directive, render_slice_briefing
+                    briefing = render_slice_briefing(astm, scan_item)
+                    # The specialization itself: what kind of defect this area is shaped
+                    # to hide. Without it every slice is told the same thing, because the
+                    # synthesis archetypes differ by only three tools in total.
+                    focus = render_focus_directive(astm, scan_item)
+                except Exception as exc:
+                    # Context is an enhancement; a campaign without it is the behaviour
+                    # that shipped before, so this must never cost the scan.
+                    print(f"[SURVEY CONTEXT WARNING] {exc}", file=sys.stderr)
+
+            # What earlier runs established here. Findings and learnings have always
+            # accumulated across runs, but nothing assembled them for the node that
+            # decides where to look: `get_findings` is scoped to the current run, and
+            # only the patcher carries the cross-run tools -- long after the decisions
+            # that mattered. Without this every audit rediscovers the same ground.
+            prior_memory = ""
+            hypotheses_text = ""
+            try:
+                from core.memory import recall, render_memory_for_agent
+
+                # Two different questions, so two different scopes -- but each asked
+                # once. The target-scoped recall becomes the memory block. The unscoped
+                # one is what makes a cross-area lead possible at all: by definition it
+                # must come from somewhere this agent is not being sent.
+                prior_memory = render_memory_for_agent(recall(db_path, target=scan_item))
+                all_memory = recall(db_path)
+
+                from core.correlator import generate_hypotheses, render_hypotheses_for_agent
+
+                hypotheses_text = render_hypotheses_for_agent(
+                    generate_hypotheses(all_memory, scan_item)
+                )
+            except Exception as exc:
+                # Same rule as the survey context: memory is an enhancement, and a
+                # knowledge base that cannot be read costs recall, not the run.
+                print(f"[MEMORY WARNING] {exc}", file=sys.stderr)
+
+            # What earlier runs did to THIS area specifically. Distinct from the memory
+            # block above, which reports what was FOUND: this reports what was LOOKED
+            # AT, so "examined and clean" stops being indistinguishable from "never
+            # opened". Operator-authored text selected by a band key; carries no
+            # repository bytes.
+            coverage_note = ""
+            try:
+                from core.planner import render_coverage_note
+                coverage_note = render_coverage_note(coverage_plan, scan_item)
+            except Exception as exc:
+                print(f"[COVERAGE PLAN WARNING] {exc}", file=sys.stderr)
+            # Counters either side of this campaign. budget_ctrl is shared across the
+            # whole run, so a single campaign's cost is the delta, not the total.
+            # Its own elapsed clock supplies the timing, rather than a second time
+            # source that could disagree with the banner the operator reads.
+            spend_t0 = budget_ctrl.elapsed_seconds
+            tokens_before = budget_ctrl.accumulated_tokens
+            steps_before = budget_ctrl.graph_steps
+            llm_calls_before = budget_ctrl.llm_calls
             try:
                 task_failed = await execute_sub_task(
                     runner,
@@ -518,16 +1229,63 @@ async def pipeline(
                     status_map=config.get("on_enter_status", {}),
                     seed_prompt_template=config.get("seed_prompt", DEFAULT_SEED_PROMPT),
                     budget_controller=budget_ctrl,
+                    slice_briefing=briefing,
+                    focus_directive=focus,
+                    prior_memory=prior_memory,
+                    coverage_note=coverage_note,
+                    hypotheses=hypotheses_text,
                 )
+                # What this campaign actually cost. Recorded for completed campaigns
+                # only -- including failed ones, which still ran the graph and are a
+                # real observation. The budget-pause path below deliberately does NOT
+                # record: a campaign cut off partway through cost less than a campaign
+                # costs, and averaging truncated runs in would bias every future
+                # estimate downward, making the next run plan a scan it cannot finish.
+                try:
+                    from core.cost import record_spend
+
+                    record_spend(
+                        db_path,
+                        run_id,
+                        scan_item,
+                        scan_mode,
+                        tokens=budget_ctrl.accumulated_tokens - tokens_before,
+                        llm_calls=budget_ctrl.llm_calls - llm_calls_before,
+                        graph_steps=budget_ctrl.graph_steps - steps_before,
+                        elapsed_seconds=budget_ctrl.elapsed_seconds - spend_t0,
+                        metadata={"failed": bool(task_failed)},
+                    )
+                except Exception as exc:
+                    # Bookkeeping must never cost a scan that is finding real bugs.
+                    print(f"[SPEND LEDGER WARNING] {exc}", file=sys.stderr)
+
                 if task_failed:
                     failures += 1
                 else:
                     successes += 1
+                    # Credited ONLY here. A campaign that crashed, was skipped, or was
+                    # cut short by the budget did not examine this area, and recording
+                    # it as examined would tell every later run that ground is covered
+                    # when nobody looked -- a silent permanent blind spot, strictly
+                    # worse than having no ledger at all.
+                    examined_areas.append(scan_item)
             except BudgetExceededError as be:
+                # Report COVERAGE, not just budget. The banner already prints tokens,
+                # steps and elapsed time, but for a file-by-file scan the number that
+                # decides whether the result means anything is how much of the tree was
+                # actually examined. "Paused at 10M tokens" reads like completion;
+                # "examined 4,102 of 462,079 files (0.9%)" cannot be misread.
+                examined_n = len(examined_areas)
+                planned_n = len(targets_to_scan)
+                pct = (100.0 * examined_n / planned_n) if planned_n else 0.0
                 print("\n" + budget_ctrl.format_pause_banner(
                     trigger=be.details,
                     target=str(scan_target),
                     workflow=str(workflow_path),
+                    progress_summary=(
+                        f"examined {examined_n} of {planned_n} {scan_mode} target(s) "
+                        f"({pct:.1f}%); {planned_n - examined_n} never opened"
+                    ),
                 ))
                 paused = True
                 break
@@ -545,23 +1303,138 @@ async def pipeline(
     finally:
         await runner.close()
 
+    # File what this run actually examined, so the next one can tell "audited and clean"
+    # apart from "never opened". Written after the loop rather than per-campaign: one
+    # artifact write instead of N, and a run that was interrupted still credits every
+    # area that did complete.
+    if examined_areas:
+        try:
+            from core.memory import record_coverage
+
+            record_coverage(
+                db_path,
+                run_id,
+                str(target_path),
+                examined_areas,
+                snapshot_id=(astm or {}).get("snapshot_id", "") if astm else snapshot_id,
+            )
+        except Exception as exc:
+            # Same rule as survey persistence: this benefits the NEXT run and must
+            # never cost this one its results.
+            print(f"[COVERAGE WARNING] {exc}", file=sys.stderr)
+
+
     findings = read_findings(db_path, run_id=run_id)
     scores = read_risk_scores(db_path, run_id=run_id)
-    suppressed_statuses = {"duplicate_merged", "false_positive", "non_viable", "sample_or_test", "reported"}
-    active_findings = [f for f in findings if f.get("status") not in suppressed_statuses]
+    # Case-insensitive via the shared predicate. `schemas.py` hands the LLM an
+    # upper-case vocabulary (`FALSE_POSITIVE`) while this comparison was lower case,
+    # so a dismissed finding was being counted, correlated and exported as live.
+    from core.database import is_suppressed
+
+    active_findings = [f for f in findings if not is_suppressed(f.get("status"))]
     print(f"\n📊 Summary: {len(active_findings)} active / {len(findings)} total vulnerability finding(s) recorded.")
     for f in findings:
         lines_str = f" (Lines: {f.get('line_numbers')})" if f.get('line_numbers') else ""
         st = f.get("status") or ""
-        if st == "duplicate_merged":
+        st_key = str(st).strip().lower()
+        if st_key == "duplicate_merged":
             mark = " [duplicate_merged]"
-        elif st == "reported":
+        elif st_key == "reported":
             mark = " (suppressed at review)"
-        elif st in ("false_positive", "non_viable", "sample_or_test"):
+        elif st_key in ("false_positive", "non_viable", "sample_or_test"):
             mark = f" [{st}]"
         else:
             mark = f" [{st}]" if st else ""
         cprint(f"  - [{f.get('severity', 'Unknown')}] {f.get('filepath')}: {f.get('title')}{lines_str}{mark}")
+
+    # Join findings that describe different ends of the same defect.
+    #
+    # This is the payoff of slicing. Splitting a repository is what lets a large target
+    # be examined at all, and it is also exactly what guarantees that the two halves of
+    # a cross-module defect are seen by different agents who cannot see each other's
+    # work. Nothing read findings back together until now.
+    #
+    # Suppressed findings are excluded: correlating false positives with each other
+    # manufactures patterns out of noise, which is worse than reporting nothing.
+    try:
+        from core.correlator import correlate, summarize_correlations
+
+        correlation = correlate(active_findings)
+        if correlation.get("available"):
+            print(f"\n🔗 {summarize_correlations(correlation)}")
+            for group in correlation.get("groups", []):
+                # Group keys are symbols and paths from repository content -> cprint.
+                cprint(
+                    f"  - [{group.get('kind')}] {group.get('key')}: "
+                    f"{len(group.get('members', []))} findings"
+                )
+            print(
+                "    These are observations, not conclusions: a grouping is a reason "
+                "to look for a chain, not evidence that one exists."
+            )
+    except Exception as exc:
+        # Correlation is an enhancement to the report. Losing it must not cost the
+        # operator the findings themselves.
+        print(f"[CORRELATION WARNING] {exc}", file=sys.stderr)
+
+    # What shape did this audit have?
+    #
+    # Absent ground truth we cannot report recall, so the run describes itself instead
+    # and lets the operator judge whether the shape is plausible for their repository.
+    # The failure this targets is the one that looks like success: twenty findings that
+    # are really one finding twenty times.
+    #
+    # Deliberately no score and no threshold. A repository with one real defect SHOULD
+    # produce one finding in one area, and a metric that called that a failure would be
+    # worse than no metric at all.
+    try:
+        from core.diversity import measure, render_metrics
+
+        for line in render_metrics(measure(findings, examined_areas)):
+            # Counts and ratios only, no repository bytes -> print, not cprint.
+            print(f"    {line}")
+    except Exception as exc:
+        print(f"[METRICS WARNING] {exc}", file=sys.stderr)
+
+    # Hand the findings to whatever the deployment actually uses.
+    #
+    # Opt-in: writing a file nobody asked for is an unexpected egress, and the path
+    # is the operator's to choose. Absent configuration this block does nothing.
+    #
+    # Unlike the metrics and correlation above, a failure here ABORTS rather than
+    # warns. Those are enhancements to a report the operator is already reading. An
+    # export is a handoff to a system they will read INSTEAD, so a missing or
+    # truncated file is indistinguishable from a scan that found nothing -- the same
+    # reason a misconfigured evidence source stops the run.
+    sarif_path = str(config.get("sarif_output") or "").strip()
+    if sarif_path:
+        from core.paths import validate_data_path
+        from core.sarif import SarifExportError, write_sarif
+
+        resolved_sarif, path_error = validate_data_path(sarif_path)
+        if path_error:
+            # Refused, not downgraded to a default location. An operator who asked
+            # for a specific path and silently got another one would look for the
+            # export where they asked for it and conclude the run produced nothing.
+            raise SarifExportError(f"Cannot write SARIF: {path_error}")
+        count, skipped = write_sarif(
+            str(resolved_sarif),
+            active_findings,
+            scan_root=str(target_path),
+        )
+        print(f"\n📤 SARIF: wrote {count} result(s) to {resolved_sarif}")
+        if skipped:
+            # Named, not counted. A finding absent from the export is invisible in
+            # whatever the operator reads next, so the omission has to be stated
+            # here where they can still see it.
+            print(
+                f"    {len(skipped)} finding(s) could not be exported and are "
+                f"ONLY in the knowledge base:"
+            )
+            for reason in skipped:
+                cprint(f"      - {reason}")
+
+
     if scores:
         print("\n🎯 Risk Calibration Scores:")
         for s in scores:
@@ -633,6 +1506,34 @@ def parse_cli_args():
         default=None,
         help="Per-node visit runaway tool loop ceiling override (defaults to workflow budget)",
     )
+    # The budget pause banner prints a copy-pasteable "--resume <run_id>" command, and
+    # README documents it, but until now the flag existed only in scripts/launch.py.
+    # Anyone who launched main.py directly was told to run a flag argparse would reject.
+    # Harmless when a paused run was rare; routine once file-by-file scans are the
+    # default, because pausing on budget IS the normal way a large scan proceeds.
+    parser.add_argument(
+        "--resume",
+        type=str,
+        default="",
+        help="Run ID to resume execution from where it paused",
+    )
+    parser.add_argument(
+        "--scan-mode",
+        type=str,
+        default=None,
+        choices=list(_SCAN_MODES),
+        help=(
+            "Scan mode. file-by-file asks one question of every file; "
+            "cross-functional hunts defects that span files. Defaults to the "
+            "workflow config, or auto."
+        ),
+    )
+    parser.add_argument(
+        "--yes",
+        "-y",
+        action="store_true",
+        help="Skip the work-plan confirmation prompt (for non-interactive use)",
+    )
     return parser.parse_args()
 
 
@@ -658,6 +1559,9 @@ if __name__ == "__main__":
                 enable_context_cache=False if args.no_context_cache else None,
                 max_llm_calls_override=args.max_llm_calls,
                 max_node_tool_calls_override=args.max_node_tool_calls,
+                resume_run_id=args.resume,
+                scan_mode_override=args.scan_mode,
+                assume_yes=args.yes,
             )
         )
         sys.exit(exit_code)

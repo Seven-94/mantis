@@ -261,6 +261,9 @@ def run_launch(
         return 0
 
     # Research Graph Synthesis
+    # Set here rather than inside the branch below: the pipeline call at the end of this
+    # function reads it unconditionally, and a run without an objective never surveys.
+    survey_astm = None
     if objective:
         base_budget = BudgetConfig()
         if workflow_path:
@@ -296,6 +299,26 @@ def run_launch(
                 effective_sandbox = "static-only"
         effective_sandbox = effective_sandbox or "static-only"
 
+        # Survey the repository before synthesizing, so the graph is shaped by what is
+        # actually in the target rather than by the objective string alone. An objective
+        # that names a domain still wins; this only supplies an answer where there was
+        # previously none.
+        #
+        # Failure here is not fatal. Synthesis without a map is exactly the behaviour
+        # that shipped before, so a surveyor problem costs specificity, not the run.
+        try:
+            from core.surveyor import survey
+            survey_astm = survey(str(target_path))
+            top = survey_astm.get("slices", [])
+            if top:
+                print(
+                    f"🗺️  Surveyed {survey_astm.get('provenance', {}).get('groups_considered', 0)} "
+                    f"candidate areas in {survey_astm.get('provenance', {}).get('elapsed_seconds', 0)}s."
+                )
+        except Exception as exc:
+            print(f"  Surveyor unavailable ({exc}); synthesizing from the objective alone.", file=sys.stderr)
+            survey_astm = None
+
         spec = synthesizer.synthesize(
             objective=objective,
             budget_config=synth_budget,
@@ -304,7 +327,20 @@ def run_launch(
             use_llm=synthesize_llm,
             model=model,
             timeout=timeout,
+            astm=survey_astm,
         )
+        meta = spec.evolution_metadata or {}
+        if meta.get("archetype_source") == "repository":
+            print(
+                f"  Archetype '{meta.get('archetype')}' inferred from repository content "
+                f"(the objective named no domain)."
+            )
+        if meta.get("sandbox_clamp"):
+            clamp = meta["sandbox_clamp"]
+            print(
+                f"  🔒 Sandbox request '{clamp.get('requested')}' clamped to "
+                f"'{clamp.get('effective')}': {clamp.get('reason')}"
+            )
         mantis_home = os.environ.get("MANTIS_HOME")
         if mantis_home:
             workspace_dir = (Path(mantis_home) / "workspace").resolve()
@@ -438,6 +474,9 @@ def run_launch(
                 objective=objective,
                 max_llm_calls_override=cli_budget_overrides.get("max_llm_calls"),
                 max_node_tool_calls_override=cli_budget_overrides.get("max_node_tool_calls"),
+                # Already paid for above. Surveying chromium costs ~65s; the pipeline
+                # would otherwise repeat it to answer the same question.
+                precomputed_astm=survey_astm,
             )
         )
     except MantisAuthError as ae:

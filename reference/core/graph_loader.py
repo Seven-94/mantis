@@ -140,6 +140,48 @@ class WorkflowSpec(_Base):
     budget: Optional[dict[str, Any]] = None
 
 
+_DISMISSAL_ROUTES = ("false_positive", "non_viable")
+
+
+def _persist_dismissal_verdict(node_id: str, route, verdict) -> None:
+    """Record a dismissal verdict as the finding status, deterministically.
+
+    The reviewer and critic ROUTE dismissals but hold no write tool, and the
+    only status stamps fire on promotion edges (on_enter_status). Without this,
+    a rejected finding stayed `reported` forever: exports looked clean only
+    because `reported` is suppressed, and cross-run false-positive learning
+    never saw a single dismissed row. The route vocabulary maps one-to-one onto
+    the status vocabulary, so the classifier -- harness code, already the
+    single point where every verdict passes -- is where the record is made.
+
+    Verdicts whose reason begins with "Fallback:" are synthesized by
+    _sanitize_structured_response for safety-blocked or non-schema model
+    output. Routing them is fail-closed; RECORDING them would teach every
+    future run that the finding was reviewed and dismissed when no review
+    happened. Route it, never learn it.
+
+    Best-effort by design: a broken database must never break routing.
+    """
+    if route not in _DISMISSAL_ROUTES:
+        return
+    try:
+        reason = ""
+        if isinstance(verdict, dict):
+            reason = str(verdict.get("reason") or "")
+        elif hasattr(verdict, "reason"):
+            reason = str(getattr(verdict, "reason") or "")
+        if reason.lstrip().startswith("Fallback:"):
+            return
+        from core.context import current_run_context
+        rc = current_run_context.get()
+        if rc is None or not rc.db_path or not rc.run_id or not rc.target_file:
+            return
+        from core.database import update_status
+        update_status(rc.db_path, rc.target_file, rc.run_id, route)
+    except Exception as exc:
+        print(f"[{node_id}] could not persist '{route}' verdict: {exc}", file=sys.stderr)
+
+
 def create_classifier(node_id: str, routes: list[str], max_visits: int = 1):
     async def _classify(ctx: Context, node_input: Any = None):
         state_key = f"{node_id}_visits"
@@ -175,6 +217,12 @@ def create_classifier(node_id: str, routes: list[str], max_visits: int = 1):
 
         if isinstance(route, str):
             route = route.lower().strip()
+
+        # Persisted on the PARSED route, before any routing decision: dismissal
+        # routes are deliberately undeclared in workflow.json (they fall through
+        # DEFAULT_ROUTE to the calibrator), so a declared-routes-only hook would
+        # never see them -- which is precisely how they went unrecorded before.
+        _persist_dismissal_verdict(node_id, route, verdict)
 
         if max_visits and max_visits > 1 and visits >= max_visits:
             return adk.Event(output=node_input, state={state_key: visits}, route="exceeded")
@@ -668,6 +716,33 @@ def load_workflow_from_json(
             f"Unknown sandbox type '{spec.config.sandbox.type}'. Available: {sorted(ENVIRONMENTS)}"
         )
 
+    # Tools this deployment declared for itself.
+    #
+    # Built HERE, after the sandbox type is known and before any node resolves its tool
+    # list, because an executable tool's permission depends on the effective backend. A
+    # Lane B tool whose floor is not met fails the graph load; it is never quietly
+    # dropped, because the run would then produce a report that reflects less analysis
+    # than was configured while looking exactly like one that had it all.
+    #
+    # Custom tools are merged UNDER the built-ins, and a name collision is refused
+    # inside build_custom_tools rather than resolved here. Letting a declared tool win a
+    # collision would point an audited chokepoint at unreviewed code; letting the
+    # built-in win silently would give the operator a tool that is not the one they
+    # declared.
+    custom_tools: dict = {}
+    try:
+        from core.custom_tools import build_custom_tools
+
+        custom_tools = build_custom_tools(
+            spec.config.model_dump(),
+            builtin_names=tuple(TOOLS),
+            effective_sandbox=spec.config.sandbox.type,
+        )
+    except Exception as e:
+        errors.append(f"Custom tools: {e}")
+
+    resolvable_tools = {**TOOLS, **custom_tools}
+
     nodes = {}
     node_specs = {}
     declared_node_ids = set()
@@ -719,8 +794,8 @@ def load_workflow_from_json(
             agent_tools = []
             tools_list = []
             for t in node_cfg.tools:
-                if t in TOOLS:
-                    tools_list.append(TOOLS[t])
+                if t in resolvable_tools:
+                    tools_list.append(resolvable_tools[t])
                 else:
                     errors.append(f"Node {node_id}: Unknown tool '{t}'")
                     node_has_error = True

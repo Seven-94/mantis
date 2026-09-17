@@ -1320,8 +1320,14 @@ class ResilientLiteLlm(LiteLlm):
                     "reason": f"Fallback: {clean_snippet}",
                 }
             elif schema_name == "ReviewVerdict":
+                # Fail CLOSED like the other two verdicts. The old value
+                # ("confirmed") promoted a safety-blocked or garbage response
+                # into a confirmed vulnerability and sent it down the
+                # critic/repro chain. The "Fallback:" reason prefix is a
+                # contract with the classifier: synthesized dismissals are
+                # routed but never persisted as finding status.
                 fallback_payload = {
-                    "route": "confirmed",
+                    "route": "false_positive",
                     "reason": f"Fallback: {clean_snippet}",
                 }
             elif schema_name == "CriticVerdict":
