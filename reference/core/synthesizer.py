@@ -1118,12 +1118,25 @@ class ResearchGraphSynthesizer:
         try:
             import litellm
 
-            _, llm_kwargs = get_llm_kwargs(
-                chosen_model,
-                DEFAULT_MODEL,
-                api_base=None,
-                timeout=timeout or 60.0,
-            )
+            # Hermetic-env deferral, same discipline as graph_loader's build path:
+            # a missing cloud project must fail at CALL time, not at kwargs-build
+            # time. litellm.completion raises the same configuration error itself
+            # if the env is genuinely absent -- caught by this method's existing
+            # fallback-to-archetype handler -- while tests that mock the
+            # completion call (and hermetic environments generally) get to reach
+            # the mock instead of dying on eager env validation. Every OTHER
+            # kwargs failure (bad model, bad timeout) still fails here, loudly.
+            try:
+                _, llm_kwargs = get_llm_kwargs(
+                    chosen_model,
+                    DEFAULT_MODEL,
+                    api_base=None,
+                    timeout=timeout or 60.0,
+                )
+            except ValueError as exc:
+                if "VERTEXAI_PROJECT" not in str(exc) and "GOOGLE_CLOUD_PROJECT" not in str(exc):
+                    raise
+                llm_kwargs = {"timeout": timeout or 60.0}
 
             user_prompt = (
                 f'Synthesize an optimal Google ADK workflow specification for the following security audit objective:\n\n'

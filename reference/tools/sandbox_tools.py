@@ -63,6 +63,60 @@ def _is_non_repro_node(ctx) -> bool:
     return bool(active and active not in ("reproducer", "patcher"))
 
 
+def _note_dynamic_evidence(
+    ctx,
+    output: str,
+    exit_code: int,
+    sink_symbol: str = "",
+    sentinel_content: str = "",
+) -> None:
+    """Sets ctx.sandbox_executed IFF reached-sink evidence is actually present.
+
+    WHY THIS IS A CHOKEPOINT AND NOT AN INLINE ASSIGNMENT
+    -----------------------------------------------------
+    `ctx.sandbox_executed` is consumed downstream (main.py's status gate) as "dynamic
+    evidence exists for this campaign": it is the sole thing standing between a
+    model-asserted `dynamic_confirmed` / `patch_verified` verdict and the knowledge
+    base recording it as machine-verified. The flag used to be set by ANY command
+    whose exit code was not 127 -- `echo hi` counted as dynamic execution -- which
+    made the evidence tier a statement about shell availability, not about the
+    exploit reaching its sink. INV-1 requires reached-sink proof: the sentinel token
+    flushed from inside the target's execution path, or a target-produced sanitizer
+    or crash backtrace. `check_reached_sink_evidence` is the deterministic authority
+    for exactly that question, so the flag is now derived from it and from nothing
+    else. Every site that used to write the flag routes through here, which keeps
+    the tightening un-forkable: a future call site cannot quietly reintroduce the
+    "a command ran at all" standard without bypassing this function by hand.
+
+    FAIL DIRECTION
+    --------------
+    The flag only ever moves False -> True, and only on a positive verdict. It is
+    never cleared here: one sentinel-verified execution earlier in the campaign is
+    not un-proven by a later failed command, and clearing would let an attacker (or
+    an unlucky flake) erase real evidence by running one broken command afterwards.
+    Conversely, an exception inside the checker leaves the flag untouched -- when
+    the evidence question cannot be answered, the answer is "no evidence" (INV-1
+    fail-closed), which costs a re-run rather than laundering a guess into a
+    machine-verified status.
+    """
+    if ctx is None:
+        return
+    try:
+        evidence_present, _reason = check_reached_sink_evidence(
+            output=output,
+            exit_code=exit_code,
+            sink_symbol=sink_symbol,
+            sentinel_content=sentinel_content,
+        )
+        if evidence_present:
+            ctx.sandbox_executed = True
+    except Exception:
+        # Deliberately swallowed: the checker is pure string/regex work and should
+        # never raise, but if it does, "could not verify" must degrade to "flag
+        # stays as it was", never to "flag set". See FAIL DIRECTION above.
+        pass
+
+
 async def run_sandbox(command: str) -> str:
     """Executes a command securely inside the configured sandbox. Use this to compile or run the reproduction script."""
     ctx = current_run_context.get()
@@ -124,8 +178,18 @@ async def run_sandbox(command: str) -> str:
                         f"ERROR: Sandbox execution permanently blocked (sandbox unavailable, attempt {ctx.static_sandbox_attempts}). "
                         f"Dynamic execution is disabled. Do NOT call run_sandbox again."
                     )
-            elif res.exit_code != 127:
-                ctx.sandbox_executed = True
+            else:
+                # Evidence, not liveness: the flag is only set when THIS command's
+                # own trace carries reached-sink proof (sentinel token or a
+                # target-produced crash), via the chokepoint above. The old rule --
+                # any exit code but 127 -- certified "a shell existed", and the
+                # downstream status gate read that as "the exploit was dynamically
+                # verified". Callers going through run_sandbox_with_evidence also
+                # get the sidecar sentinel file considered; a bare run_sandbox call
+                # only has its output to speak for it, which is exactly as much as
+                # it proved.
+                _note_dynamic_evidence(ctx, raw_output, res.exit_code)
+
             if not raw_output:
                 return f"exit={res.exit_code}"
             scrubbed_output = SecretScrubber.scrub(raw_output)
@@ -148,8 +212,20 @@ async def run_sandbox(command: str) -> str:
                         f"ERROR: Sandbox execution permanently blocked (sandbox unavailable, attempt {ctx.static_sandbox_attempts}). "
                         f"Dynamic execution is disabled. Do NOT call run_sandbox again."
                     )
-            elif res.startswith("exit=") and not res.startswith("exit=127"):
-                ctx.sandbox_executed = True
+            elif res.startswith("exit="):
+                # Same evidence standard as the ExecutionResult branch, applied to
+                # the stringified transport some sandbox backends use. The exit code
+                # is parsed out of the "exit=N" prefix so the checker sees the same
+                # two inputs either way; an unparseable prefix falls through with
+                # the flag untouched, because a malformed transcript is not proof
+                # of anything (fail-closed, INV-1).
+                head, _, body = res.partition("\n")
+                try:
+                    parsed_exit = int(head.split("=", 1)[1].strip())
+                except (ValueError, IndexError):
+                    parsed_exit = None
+                if parsed_exit is not None:
+                    _note_dynamic_evidence(ctx, body, parsed_exit)
             return SecretScrubber.scrub(res)
         return SecretScrubber.scrub(str(res))
     except Exception as e:
@@ -194,6 +270,22 @@ async def run_sandbox_with_evidence(
         sink_symbol=sink_symbol,
         sentinel_content=sentinel_content,
     )
+
+    # This wrapper sees a channel the inner run_sandbox cannot: the sidecar sentinel
+    # file, read from inside the sandbox above. A PoC whose sentinel reached the file
+    # but never stdout is real reached-sink proof, so the verdict computed here --
+    # with every channel populated -- is fed into the same chokepoint the inner call
+    # used. The chokepoint is monotonic and positive-only, so a stricter negative
+    # here (e.g. a crash that failed to name the requested sink) never erases
+    # evidence an earlier verified execution already established.
+    if evidence_present:
+        _note_dynamic_evidence(
+            current_run_context.get(),
+            output,
+            exit_code,
+            sink_symbol=sink_symbol,
+            sentinel_content=sentinel_content,
+        )
 
     return {
         "raw": raw_res,

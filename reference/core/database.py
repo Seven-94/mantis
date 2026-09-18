@@ -283,6 +283,30 @@ def init_db(db_path: str):
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_okf_type ON okf_concepts(type)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_okf_concept_id ON okf_concepts(concept_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_okf_trust_tier ON okf_concepts(trust_tier)")
+
+        # Hypothesis chains: planner-authored multi-component vulnerability
+        # hypotheses ("component A trusts B's output; B's validation is weak;
+        # still needed: reachability from the edge"), with each link confirmed
+        # or refuted deterministically by later campaign outcomes. Deliberately
+        # NOT run-scoped on read: multi-system bugs are found over weeks of
+        # separate audits, not in one run, so this table is the cross-session
+        # memory for the dynamic planner -- a chain opened in January is
+        # settled by campaigns in March. `links` and `evidence` hold JSON.
+        # Every row originated from an LLM, so consumers (core.chains) treat
+        # stored content as untrusted and sanitize on the way OUT.
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS hypothesis_chains (
+                chain_id TEXT PRIMARY KEY,
+                run_id TEXT,
+                created_at TEXT,
+                updated_at TEXT,
+                description TEXT,
+                links TEXT,
+                status TEXT DEFAULT 'open',
+                evidence TEXT
+            )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hypothesis_chains_status ON hypothesis_chains(status)")
         cursor.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
 
 

@@ -76,13 +76,57 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-time",
         type=str,
         default=None,
-        help="Wall-clock time ceiling override before graceful pause (e.g. 12h, 24h, 30m; defaults to workflow budget)",
+        help="Wall-clock time ceiling override before graceful pause (e.g. 12h, 24h, 30m, or 'unlimited'; defaults to workflow budget)",
     )
     parser.add_argument(
         "--token-budget",
         type=str,
         default=None,
-        help="Token consumption ceiling override before graceful pause (e.g. 10M, 5M, 500k; defaults to workflow budget)",
+        help="Token consumption ceiling override before graceful pause (e.g. 10M, 5M, 500k, or 'unlimited'; defaults to workflow budget)",
+    )
+    parser.add_argument(
+        "--no-budget",
+        action="store_true",
+        help=(
+            "Disable the wall-clock and token spend ceilings entirely (for dedicated "
+            "hardware or unmetered budgets). Runaway-loop guards stay active."
+        ),
+    )
+    parser.add_argument(
+        "--no-replan",
+        action="store_true",
+        help=(
+            "Disable dynamic replanning: freezes the campaign plan at run "
+            "start so a rerun holds the same plan (for reproducibility)."
+        ),
+    )
+    parser.add_argument(
+        "--parallel",
+        type=int,
+        default=1,
+        help=(
+            "Number of campaigns to run concurrently (default: 1, the "
+            "sequential behaviour). Run-level budget ceilings are shared "
+            "across workers; per-campaign guards stay per campaign."
+        ),
+    )
+    parser.add_argument(
+        "--focus",
+        type=str,
+        default="",
+        help=(
+            "Natural-language directive steering the campaign planner, e.g. "
+            "'look for IDOR' or 'find memory corruption issues'"
+        ),
+    )
+    parser.add_argument(
+        "--seed-report",
+        type=str,
+        default="",
+        help=(
+            "Path to a bug report file; the planner hunts variants of the "
+            "described bug, treating file content as untrusted evidence"
+        ),
     )
     parser.add_argument(
         "--max-steps",
@@ -184,6 +228,11 @@ def run_launch(
     probe_llm: bool = False,
     max_time: Optional[str] = None,
     token_budget: Optional[str] = None,
+    no_budget: bool = False,
+    no_replan: bool = False,
+    parallel: int = 1,
+    focus: str = "",
+    seed_report: str = "",
     max_steps: Optional[int] = None,
     max_node_visits: Optional[int] = None,
     max_llm_calls: Optional[int] = None,
@@ -215,6 +264,12 @@ def run_launch(
     except ValueError as ve:
         print(f"❌ Error: {ve}", file=sys.stderr)
         return 2
+    # --no-budget disables both RUN-level spend ceilings (0 = unbounded). Expressed
+    # as CLI overrides so the normal effective-budget merge and the dry-run
+    # display both see it; deliberately leaves the runaway-loop guards alone.
+    if no_budget:
+        cli_budget_overrides["max_wall_clock_seconds"] = 0.0
+        cli_budget_overrides["max_tokens"] = 0
     if max_steps is not None:
         cli_budget_overrides["max_graph_steps"] = max_steps
     if max_node_visits is not None:
@@ -443,8 +498,14 @@ def run_launch(
         print(f"  • Sandbox:       {cfg.get('sandbox', {}).get('type', 'static-only')}")
         print(f"  • Model:         {model or cfg.get('default_model')}")
         print(f"  • Knowledge DB:  {db_path or cfg.get('db_path', 'knowledge.db')}")
-        print(f"  • Max Time:      {effective_budget.max_wall_clock_seconds / 3600:.1f}h")
-        print(f"  • Token Budget:  {effective_budget.max_tokens:,}")
+        if effective_budget.max_wall_clock_seconds > 0:
+            print(f"  • Max Time:      {effective_budget.max_wall_clock_seconds / 3600:.1f}h")
+        else:
+            print("  • Max Time:      unlimited")
+        if effective_budget.max_tokens > 0:
+            print(f"  • Token Budget:  {effective_budget.max_tokens:,}")
+        else:
+            print("  • Token Budget:  unlimited")
         print(f"  • Max Steps:     {effective_budget.max_graph_steps}")
         print(f"  • Max Visits:    {effective_budget.max_node_visits}")
         if effective_budget.max_llm_calls > 0:
@@ -474,6 +535,10 @@ def run_launch(
                 objective=objective,
                 max_llm_calls_override=cli_budget_overrides.get("max_llm_calls"),
                 max_node_tool_calls_override=cli_budget_overrides.get("max_node_tool_calls"),
+                enable_replan=False if no_replan else None,
+                parallel=parallel,
+                focus=focus,
+                seed_report_path=seed_report,
                 # Already paid for above. Surveying chromium costs ~65s; the pipeline
                 # would otherwise repeat it to answer the same question.
                 precomputed_astm=survey_astm,
@@ -506,6 +571,11 @@ def main() -> int:
         probe_llm=args.probe_llm,
         max_time=args.max_time,
         token_budget=args.token_budget,
+        no_budget=args.no_budget,
+        no_replan=args.no_replan,
+        parallel=args.parallel,
+        focus=args.focus,
+        seed_report=args.seed_report,
         max_steps=args.max_steps,
         max_node_visits=args.max_node_visits,
         max_llm_calls=args.max_llm_calls,

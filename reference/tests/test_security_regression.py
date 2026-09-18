@@ -861,12 +861,19 @@ class TestBudgetCpuCeilings(unittest.TestCase):
         self.assertEqual(parse_token_budget("1B"), 1_000_000_000)
         self.assertEqual(parse_token_budget("500k"), 500_000)
 
-        # Fail closed on malformed
-        for bad_time in ["forever", "infinite", "none", "-10s", "100x"]:
+        # 0 = ceiling disabled. "unlimited"/"none"/"off" are the operator-facing
+        # spellings for it, so they parse to the sentinel instead of failing.
+        for unbounded in ["unlimited", "none", "off"]:
+            self.assertEqual(parse_duration_seconds(unbounded), 0.0)
+            self.assertEqual(parse_token_budget(unbounded), 0)
+
+        # Fail closed on genuinely malformed input. "forever"/"infinite" stay
+        # rejected: only the three documented spellings mean unbounded.
+        for bad_time in ["forever", "infinite", "-10s", "100x"]:
             with self.assertRaises((ValueError, TypeError), msg=f"Should reject {bad_time}"):
                 parse_duration_seconds(bad_time)
 
-        for bad_tok in ["100B_invalid", "unlimited", "-5M", "bad_tokens"]:
+        for bad_tok in ["100B_invalid", "-5M", "bad_tokens", "forever"]:
             with self.assertRaises((ValueError, TypeError), msg=f"Should reject {bad_tok}"):
                 parse_token_budget(bad_tok)
 
@@ -6662,6 +6669,25 @@ class TestExaminedAndCleanIsNotTheSameAsNeverExamined(unittest.TestCase):
             "targets_to_scan", assigned,
             "the plan is computed but the scan order is never changed by it.",
         )
+        # ANY assignment satisfies the check above -- and the campaign-groups
+        # work added more of them (campaign_plan targets, the groups flatten),
+        # which let the matrix neuter the reorder application while this test
+        # stayed green. Pin the exact shape: the value assigned must come from
+        # subscripting coverage_plan itself.
+        reorder_applied = any(
+            isinstance(node, ast.Assign)
+            and node.targets
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id == "targets_to_scan"
+            and isinstance(node.value, ast.Subscript)
+            and isinstance(node.value.value, ast.Name)
+            and node.value.value.id == "coverage_plan"
+            for node in ast.walk(tree)
+        )
+        self.assertTrue(
+            reorder_applied,
+            "the coverage plan's order is computed but never applied to targets_to_scan.",
+        )
         passed = {
             kw.arg
             for node in ast.walk(tree)
@@ -9499,3 +9525,249 @@ class TestStatusIntegrity(unittest.TestCase):
                 self.assertTrue(payload["reason"].startswith("Fallback:"),
                                 "The Fallback: prefix is the contract that "
                                 "stops the classifier persisting this verdict.")
+
+
+class TestModelConstructionGoesThroughKwargsResolution(unittest.TestCase):
+    """Every ResilientLiteLlm built inside the pipeline must come from
+    get_llm_kwargs, never from a bare model name.
+
+    A bare `ResilientLiteLlm(model=...)` never learns vertex_project or
+    vertex_location, so litellm falls back to us-central1 and 404s on any
+    model that only exists in the `global` location. This broke the planner
+    live (every run silently degraded to the surveyor while the graph's own
+    calls worked), and the compaction summarizer carried the same construction
+    for months -- surviving only because the fallback compaction model happens
+    to exist in the default region. The failure is invisible until someone
+    changes a model id in config, which is exactly what configs do.
+    """
+
+    def test_no_bare_resilient_llm_construction_in_pipeline(self):
+        import ast
+        import inspect
+        import textwrap
+
+        import main
+
+        tree = ast.parse(textwrap.dedent(inspect.getsource(main.pipeline)))
+        offenders = [
+            node.lineno
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "ResilientLiteLlm"
+            and any(kw.arg == "model" for kw in node.keywords)
+        ]
+        self.assertEqual(
+            offenders, [],
+            f"ResilientLiteLlm(model=...) built without get_llm_kwargs at "
+            f"pipeline line(s) {offenders}: it never learns vertex_location "
+            f"and 404s on models that only exist in the `global` region.",
+        )
+
+
+class TestMicrosandboxAutoPromotion(unittest.IsolatedAsyncioTestCase):
+    """Auto-configure promotes the tracked static-only floor to microsandbox
+    only when the tier is verified end-to-end, and never overrides an
+    explicit operator decision.
+
+    The tracked workflow.json keeps a 'static-only' floor by design (never
+    assume host capabilities in a committed file). Promotion must therefore:
+    (1) trigger only when virtualization AND a cached guest image are both
+    verified -- the runtime boots with PullPolicy.NEVER, so promoting without
+    an image bricks every reproducer campaign; (2) persist to
+    workflow.local.json, never the tracked file; (3) treat any sandbox key in
+    the local overlay or a non-static tracked type as an operator decision
+    and leave it alone; (4) fail safe: stay static-only with a loud hint when
+    the image is missing.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="mantis-promo-")
+        self.wf_path = os.path.join(self.tmp, "workflow.json")
+        with open(self.wf_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "name": "t",
+                    "config": {
+                        "db_path": "knowledge.db",
+                        "default_model": "vertex_ai/gemini-3.7-flash",
+                        "sandbox": {"type": "static-only", "options": {}},
+                    },
+                    "nodes": [],
+                    "edges": [],
+                },
+                f,
+            )
+        os.environ.setdefault("GOOGLE_CLOUD_PROJECT", "test-project")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _caps(self, image="mantis-sandbox:latest", recommended="microsandbox"):
+        return {
+            "kvm": False,
+            "docker": False,
+            "podman": False,
+            "container_tool": None,
+            "runsc": False,
+            "gcloud": False,
+            "gcp_auth": False,
+            "gcp_account": None,
+            "gcp_project": None,
+            "vertex_project": "test-project",
+            "gemini_api_key": False,
+            "anthropic_api_key": False,
+            "openai_api_key": False,
+            "llm_api_base": None,
+            "microsandbox_image": image,
+            "recommended_sandbox": recommended,
+            "available_sandboxes": ["static-only"]
+            + (["microsandbox"] if recommended == "microsandbox" or image else []),
+        }
+
+    async def test_static_floor_promotes_to_verified_microsandbox(self):
+        from scripts import configure
+
+        with patch.object(configure, "detect_capabilities", return_value=self._caps()), \
+             patch.object(configure, "run_preflight_checks_async", return_value=(True, [])):
+            cfg = await configure.ensure_configured_async(self.wf_path, auto=True)
+
+        self.assertEqual(cfg.get("sandbox", {}).get("type"), "microsandbox")
+        self.assertEqual(
+            cfg.get("sandbox", {}).get("options", {}).get("image"),
+            "mantis-sandbox:latest",
+        )
+        local = configure.get_local_workflow_path(self.wf_path)
+        self.assertTrue(os.path.exists(local), "promotion must persist to the local overlay")
+        with open(local, encoding="utf-8") as f:
+            overlay = json.load(f)
+        self.assertEqual(overlay["config"]["sandbox"]["type"], "microsandbox")
+        # The tracked file must keep its static-only floor untouched.
+        with open(self.wf_path, encoding="utf-8") as f:
+            tracked = json.load(f)
+        self.assertEqual(tracked["config"]["sandbox"]["type"], "static-only")
+
+    async def test_no_cached_image_stays_static_only(self):
+        from scripts import configure
+
+        caps = self._caps(image=None, recommended="gvisor")
+        caps["available_sandboxes"] = ["static-only", "microsandbox"]
+        with patch.object(configure, "detect_capabilities", return_value=caps), \
+             patch.object(configure, "run_preflight_checks_async", return_value=(True, [])):
+            cfg = await configure.ensure_configured_async(self.wf_path, auto=True)
+
+        self.assertEqual(cfg.get("sandbox", {}).get("type"), "static-only")
+        self.assertFalse(
+            os.path.exists(configure.get_local_workflow_path(self.wf_path)),
+            "no overlay must be written when nothing was promoted",
+        )
+
+    async def test_explicit_overlay_choice_is_never_overridden(self):
+        from scripts import configure
+
+        local = configure.get_local_workflow_path(self.wf_path)
+        with open(local, "w", encoding="utf-8") as f:
+            json.dump({"config": {"sandbox": {"type": "static-only", "options": {}}}}, f)
+
+        with patch.object(configure, "detect_capabilities", return_value=self._caps()), \
+             patch.object(configure, "run_preflight_checks_async", return_value=(True, [])):
+            cfg = await configure.ensure_configured_async(self.wf_path, auto=True)
+
+        self.assertEqual(
+            cfg.get("sandbox", {}).get("type"),
+            "static-only",
+            "an operator's explicit static-only pin in the overlay is a decision, not a floor",
+        )
+
+    async def test_cli_sandbox_override_beats_promotion(self):
+        from scripts import configure
+
+        with patch.object(configure, "detect_capabilities", return_value=self._caps()), \
+             patch.object(configure, "run_preflight_checks_async", return_value=(True, [])):
+            cfg = await configure.ensure_configured_async(
+                self.wf_path,
+                auto=True,
+                overrides={"sandbox": {"type": "static-only", "options": {}}},
+            )
+
+        self.assertEqual(cfg.get("sandbox", {}).get("type"), "static-only")
+
+    async def test_non_static_tracked_type_is_respected(self):
+        from scripts import configure
+
+        with open(self.wf_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "name": "t",
+                    "config": {
+                        "default_model": "vertex_ai/gemini-3.7-flash",
+                        "sandbox": {"type": "gvisor", "options": {}},
+                    },
+                    "nodes": [],
+                    "edges": [],
+                },
+                f,
+            )
+        caps = self._caps()
+        caps["available_sandboxes"] = ["static-only", "gvisor", "microsandbox"]
+        with patch.object(configure, "detect_capabilities", return_value=caps), \
+             patch.object(configure, "run_preflight_checks_async", return_value=(True, [])):
+            cfg = await configure.ensure_configured_async(self.wf_path, auto=True)
+
+        self.assertEqual(cfg.get("sandbox", {}).get("type"), "gvisor")
+
+    def test_recommendation_requires_cached_image(self):
+        """detect_capabilities must not recommend microsandbox without an image:
+        the runtime never pulls, so the recommendation would be unrunnable."""
+        from scripts import configure
+
+        src = inspect.getsource(configure.detect_capabilities)
+        self.assertIn(
+            'caps["microsandbox_image"]',
+            src.split("recommendation hierarchy")[1],
+            "the microsandbox recommendation branch must gate on a cached guest image",
+        )
+
+    def test_virtualization_check_is_platform_aware(self):
+        from scripts import configure
+
+        with patch.object(configure.sys, "platform", "linux"), \
+             patch.object(configure.os.path, "exists", return_value=False):
+            ok, msg = configure.check_microsandbox_virtualization()
+        self.assertFalse(ok)
+        self.assertIn("/dev/kvm", msg)
+
+        with patch.object(configure.sys, "platform", "darwin"), \
+             patch.object(configure.platform, "machine", return_value="x86_64"):
+            ok, msg = configure.check_microsandbox_virtualization()
+        self.assertFalse(ok)
+        self.assertIn("Apple Silicon", msg)
+
+        with patch.object(configure.sys, "platform", "darwin"), \
+             patch.object(configure.platform, "machine", return_value="arm64"):
+            ok, _ = configure.check_microsandbox_virtualization()
+        self.assertTrue(
+            ok,
+            "Apple Silicon with the microsandbox wheel importable must count as virtualization-capable",
+        )
+
+    def test_preflight_no_longer_hardcodes_dev_kvm(self):
+        """The old preflight refused microsandbox on any host without /dev/kvm,
+        which fired a false '[PREFLIGHT WARNING] /dev/kvm device does not
+        exist' on every macOS launch."""
+        from scripts import configure
+
+        src = inspect.getsource(configure._check_sandbox_preflight)
+        self.assertNotIn(
+            "/dev/kvm",
+            src,
+            "_check_sandbox_preflight must route through check_microsandbox_virtualization",
+        )
+        self.assertIn("check_microsandbox_virtualization", src)
+        self.assertIn(
+            "find_cached_microsandbox_image",
+            src,
+            "preflight must verify the guest image cache: PullPolicy.NEVER means a "
+            "missing image fails every campaign after preflight already said OK",
+        )
+

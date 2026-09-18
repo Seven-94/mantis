@@ -10,6 +10,7 @@ import argparse
 import asyncio
 import json
 import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -31,6 +32,17 @@ from core.config import (
     get_llm_kwargs,
     is_placeholder,
     normalize_model_id,
+)
+
+# Guest images the microsandbox tier can run. The first is the operator-built
+# image from ./install.sh (sandbox/Dockerfile); the fallbacks are the pinned
+# base images install.sh pulls directly when no container builder is present
+# (mirror.gcr.io first because some networks block Docker Hub). Keep this list
+# in sync with the FALLBACK_IMAGES list in install.sh.
+MICROSANDBOX_DEFAULT_IMAGE = "mantis-sandbox:latest"
+MICROSANDBOX_FALLBACK_IMAGES = (
+    "mirror.gcr.io/library/python:3-slim",
+    "docker.io/library/python:3-slim",
 )
 
 
@@ -184,6 +196,74 @@ def load_workflow_dict(workflow_path: str, load_local: bool = True) -> dict:
     return data
 
 
+def check_microsandbox_virtualization() -> Tuple[bool, str]:
+    """Platform-aware check that the microsandbox tier can boot microVMs here.
+
+    Linux: requires a readable/writable /dev/kvm. macOS (Apple Silicon):
+    libkrun rides Hypervisor.framework -- no /dev/kvm exists, the bundled
+    libkrunfw in the microsandbox wheel is the requirement. Mirrors the
+    platform guard in MicrosandboxEnvironment.__init__.
+    """
+    if sys.platform.startswith("linux"):
+        if not os.path.exists("/dev/kvm"):
+            return False, "/dev/kvm device does not exist."
+        if not os.access("/dev/kvm", os.R_OK | os.W_OK):
+            return False, "Current user lacks read/write permissions on /dev/kvm."
+        return True, "KVM virtualization available (/dev/kvm accessible)."
+    if sys.platform == "darwin":
+        if platform.machine() != "arm64":
+            return False, "microsandbox on macOS requires Apple Silicon (arm64)."
+        try:
+            import microsandbox as _msb  # noqa: F401
+        except Exception as e:
+            return False, f"microsandbox package not importable: {e}"
+        return True, "Hypervisor.framework virtualization available (Apple Silicon + microsandbox wheel)."
+    return False, f"microsandbox is not supported on platform '{sys.platform}'."
+
+
+def find_cached_microsandbox_image(preferred: str = "") -> Optional[str]:
+    """Returns the first locally cached guest image usable by the microsandbox tier.
+
+    The runtime boots with PullPolicy.NEVER, so an image missing from the local
+    cache means every reproducer campaign fails at first execute. Checks the
+    operator's configured image first, then the install.sh-built image, then
+    the pinned fallback base images. Returns None when nothing is cached.
+    """
+    candidates = []
+    if preferred:
+        candidates.append(preferred)
+    candidates.append(MICROSANDBOX_DEFAULT_IMAGE)
+    candidates.extend(MICROSANDBOX_FALLBACK_IMAGES)
+
+    async def _probe() -> Optional[str]:
+        from microsandbox import Image, ImageNotFoundError
+
+        for cand in candidates:
+            try:
+                await Image.get(cand)
+                return cand
+            except ImageNotFoundError:
+                continue
+            except Exception:
+                # Cache DB unavailable (locked/permissions): treat as no image
+                # rather than crashing configuration.
+                return None
+        return None
+
+    try:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop and loop.is_running():
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                return executor.submit(asyncio.run, _probe()).result()
+        return asyncio.run(_probe())
+    except Exception:
+        return None
+
+
 def detect_capabilities() -> dict:
     """Inspects the local host environment to detect available sandboxes, tools, and credentials."""
     caps: dict[str, Any] = {
@@ -204,14 +284,18 @@ def detect_capabilities() -> dict:
         "anthropic_api_key": bool(os.environ.get("ANTHROPIC_API_KEY")),
         "openai_api_key": bool(os.environ.get("OPENAI_API_KEY")),
         "llm_api_base": os.environ.get("LLM_API_BASE"),
+        "microsandbox_image": None,
         "recommended_sandbox": "static-only",
         "available_sandboxes": ["static-only"],
     }
 
-    # 1. Check KVM for microsandbox
-    if os.path.exists("/dev/kvm") and os.access("/dev/kvm", os.R_OK | os.W_OK):
-        caps["kvm"] = True
+    # 1. Check virtualization for microsandbox (Linux KVM or macOS
+    # Hypervisor.framework -- see check_microsandbox_virtualization).
+    virt_ok, _ = check_microsandbox_virtualization()
+    if virt_ok:
+        caps["kvm"] = os.path.exists("/dev/kvm") and os.access("/dev/kvm", os.R_OK | os.W_OK)
         caps["available_sandboxes"].append("microsandbox")
+        caps["microsandbox_image"] = find_cached_microsandbox_image()
 
     # 2. Check container engines and gVisor
     for tool in ("docker", "podman"):
@@ -272,13 +356,19 @@ def detect_capabilities() -> dict:
     if caps["gcloud"] and caps["gcp_auth"] and (caps["gcp_project"] or caps["vertex_project"]):
         caps["available_sandboxes"].append("gce")
 
-    # Select recommendation hierarchy
-    if "gce" in caps["available_sandboxes"] and caps["gcp_project"]:
+    # Select recommendation hierarchy. Microsandbox ranks first when a guest
+    # image is cached: it is the only tier whose runnability is fully verified
+    # client-side (hardware microVM + image present), whereas 'gce' merely
+    # having gcloud auth says nothing about the pre-provisioned VPC/subnet/VM
+    # image it needs, and gvisor shares the host kernel. Without a cached
+    # image microsandbox is NOT recommended: the runtime never pulls
+    # (PullPolicy.NEVER), so every campaign would fail at first execute.
+    if "microsandbox" in caps["available_sandboxes"] and caps["microsandbox_image"]:
+        caps["recommended_sandbox"] = "microsandbox"
+    elif "gce" in caps["available_sandboxes"] and caps["gcp_project"]:
         caps["recommended_sandbox"] = "gce"
     elif "gvisor" in caps["available_sandboxes"]:
         caps["recommended_sandbox"] = "gvisor"
-    elif "microsandbox" in caps["available_sandboxes"]:
-        caps["recommended_sandbox"] = "microsandbox"
     else:
         caps["recommended_sandbox"] = "static-only"
 
@@ -310,8 +400,9 @@ def is_default_or_unconfigured(config: dict) -> Tuple[bool, List[str]]:
         if not shutil.which("docker") and not shutil.which("podman"):
             issues.append("gVisor sandbox requires 'docker' or 'podman' on PATH.")
     elif sb_type == "microsandbox":
-        if not os.path.exists("/dev/kvm"):
-            issues.append("Microsandbox requires /dev/kvm virtualization device.")
+        virt_ok, virt_msg = check_microsandbox_virtualization()
+        if not virt_ok:
+            issues.append(f"Microsandbox virtualization unavailable: {virt_msg}")
 
     # Model checks
     model = config.get("default_model", DEFAULT_MODEL)
@@ -391,11 +482,22 @@ async def _check_sandbox_preflight(sandbox_cfg: dict, target_path: str = "") -> 
             return False, f"gVisor check failed: {e}"
 
     if sb_type == "microsandbox":
-        if not os.path.exists("/dev/kvm"):
-            return False, "/dev/kvm device does not exist."
-        if not os.access("/dev/kvm", os.R_OK | os.W_OK):
-            return False, "Current user lacks read/write permissions on /dev/kvm."
-        return True, "Microsandbox ready (/dev/kvm accessible)."
+        virt_ok, virt_msg = check_microsandbox_virtualization()
+        if not virt_ok:
+            return False, virt_msg
+        configured_image = str(sandbox_cfg.get("options", {}).get("image", "") or "")
+        cached = find_cached_microsandbox_image(preferred=configured_image)
+        if configured_image and cached != configured_image:
+            return False, (
+                f"Configured guest image '{configured_image}' is not in the local cache "
+                f"(the sandbox never pulls at run time). Run ./install.sh to provision it."
+            )
+        if not cached:
+            return False, (
+                "No microsandbox guest image found in the local cache "
+                "(the sandbox never pulls at run time). Run ./install.sh to provision one."
+            )
+        return True, f"Microsandbox ready ({virt_msg} Guest image: {cached})."
 
     return False, f"Unknown sandbox type '{sb_type}'."
 
@@ -715,6 +817,67 @@ def _refuse_silent_downgrade(reason: str) -> None:
     raise SystemExit(2)
 
 
+def _sandbox_choice_is_explicit(workflow_path: str) -> bool:
+    """True when the operator explicitly chose a sandbox tier.
+
+    An explicit choice is a 'sandbox' key in the local overlay
+    (workflow.local.json -- written by the wizard, --sandbox, or a previous
+    auto-promotion) or a non-static sandbox committed in the base
+    workflow.json. The tracked base file keeps a 'static-only' floor by
+    design, so a bare static-only there is a default, not a decision.
+    """
+    try:
+        if os.path.exists(workflow_path):
+            with open(workflow_path, "r", encoding="utf-8") as f:
+                base = json.load(f)
+            if isinstance(base, dict):
+                base_sb = (base.get("config", {}) or {}).get("sandbox", {})
+                if isinstance(base_sb, dict) and base_sb.get("type") not in (
+                    None,
+                    "",
+                    "static-only",
+                    "static",
+                ):
+                    return True
+    except Exception:
+        pass
+
+    base_dir = os.path.dirname(os.path.abspath(workflow_path))
+    base_name = os.path.basename(workflow_path)
+    stem = base_name[:-5] if base_name.endswith(".json") else base_name
+    for cand in (
+        os.path.join(base_dir, f"{stem}.local.json"),
+        os.path.join(base_dir, f".{stem}.local.json"),
+    ):
+        if not os.path.exists(cand):
+            continue
+        try:
+            with open(cand, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            # Unreadable overlay: treat as explicit so we never overwrite it.
+            return True
+        if isinstance(data, dict) and (
+            "sandbox" in data or "sandbox" in (data.get("config", {}) or {})
+        ):
+            return True
+    return False
+
+
+def _print_static_floor_hint(caps: dict) -> None:
+    """One-line, every-launch hint that dynamic reproduction is disabled."""
+    if "microsandbox" in caps.get("available_sandboxes", []):
+        print(
+            "⚠️  Sandbox is 'static-only': this host supports microsandbox but no guest "
+            "image is cached. Run ./install.sh to enable dynamic exploit reproduction."
+        )
+    else:
+        print(
+            "⚠️  Sandbox is 'static-only' (no supported isolation tier detected on this host). "
+            "Dynamic exploit reproduction is DISABLED."
+        )
+
+
 async def ensure_configured_async(
     workflow_path: str = "",
     auto: bool = True,
@@ -743,9 +906,28 @@ async def ensure_configured_async(
     sb_opts = dict(cfg.get("sandbox", {}).get("options", {}))
     sb_available = sb_type in caps.get("available_sandboxes", ["static-only"])
 
-    if not is_unconf and not overrides and sb_available:
+    # Auto-promotion: a 'static-only' floor inherited from the tracked
+    # workflow.json is a default, not an operator decision. When this host can
+    # actually run microsandbox (virtualization + cached guest image verified),
+    # promote to it and persist, instead of silently skipping dynamic
+    # reproduction forever. An explicit operator choice (any sandbox key in
+    # workflow.local.json, a non-static tracked type, or a --sandbox override
+    # this invocation) is never second-guessed.
+    promote_to_microsandbox = (
+        auto
+        and not interactive
+        and sb_type in ("static-only", "static")
+        and "sandbox" not in overrides
+        and caps.get("recommended_sandbox") == "microsandbox"
+        and bool(caps.get("microsandbox_image"))
+        and not _sandbox_choice_is_explicit(target_wf)
+    )
+
+    if not is_unconf and not overrides and sb_available and not promote_to_microsandbox:
         ok, _ = await run_preflight_checks_async(cfg, probe_llm=probe_llm)
         if ok:
+            if sb_type in ("static-only", "static"):
+                _print_static_floor_hint(caps)
             return cfg
 
     updates: dict[str, Any] = {}
@@ -754,6 +936,23 @@ async def ensure_configured_async(
         return run_interactive_wizard(target_wf)
 
     if auto:
+        if promote_to_microsandbox:
+            msb_image = caps["microsandbox_image"]
+            updates["sandbox"] = {
+                "type": "microsandbox",
+                "options": {"image": msb_image},
+            }
+            sb_type = "microsandbox"
+            sb_opts = {"image": msb_image}
+            cfg = {**cfg, "sandbox": {"type": "microsandbox", "options": dict(sb_opts)}}
+            print(
+                f"🔒 Auto-configured sandbox: 'microsandbox' (networkless hardware microVM, "
+                f"guest image '{msb_image}'). Persisting to workflow.local.json; "
+                f"override with --sandbox or configure.py."
+            )
+        elif sb_type in ("static-only", "static") and "sandbox" not in overrides:
+            _print_static_floor_hint(caps)
+
         # Auto-resolve GCE project if unconfigured
         if sb_type == "gce":
             cur_proj = sb_opts.get("project", "")
@@ -877,7 +1076,7 @@ def run_interactive_wizard(workflow_path: str) -> dict:
     cfg = wf_data.get("config", {})
 
     print("Detected Host Capabilities:")
-    print(f"  • KVM Virtualization: {'✅ Available' if caps['kvm'] else '❌ Not found'}")
+    print(f"  • MicroVM Support:    {'✅ Available' if 'microsandbox' in caps['available_sandboxes'] else '❌ Not found'} (guest image: {caps.get('microsandbox_image') or '❌ none cached'})")
     print(f"  • Container Engine:   {caps['container_tool'] or '❌ None'} (runsc: {'✅ Yes' if caps['runsc'] else '❌ No'})")
     print(f"  • Google Cloud SDK:   {'✅ Active (' + str(caps['gcp_account']) + ')' if caps['gcp_auth'] else '❌ No active auth'}")
     print(f"  • GCP Project:        {caps['gcp_project'] or '❌ Not set'}")
@@ -888,7 +1087,7 @@ def run_interactive_wizard(workflow_path: str) -> dict:
     sb_choices = [
         ("static-only", "Static Analysis only (Fastest, zero isolation requirement)"),
         ("gvisor", "gVisor Container Sandbox (Networkless OCI container with runsc)"),
-        ("microsandbox", "Microsandbox VM (Hardware-accelerated KVM microVM)"),
+        ("microsandbox", "Microsandbox VM (Hardware microVM: KVM on Linux, Hypervisor.framework on macOS)"),
         ("gce", "Google Compute Engine Sandbox (Hardened ephemeral cloud VM)"),
     ]
     for i, (k, desc) in enumerate(sb_choices, 1):

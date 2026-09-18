@@ -1,3 +1,4 @@
+import functools
 import json
 import os
 import re
@@ -15,7 +16,7 @@ from google.genai import types
 from core.prompts import get_stage_prompt, STAGE_PROMPTS
 
 
-from core.config import get_llm_kwargs, DEFAULT_MODEL, ResilientLiteLlm
+from core.config import get_llm_kwargs, DEFAULT_MODEL, ResilientLiteLlm, DeferredEnvLiteLlm, ExtendedReviewVerdict
 
 LiteLlm = ResilientLiteLlm
 from core.environments import ENVIRONMENTS, get_shared_proxy_environment
@@ -182,7 +183,222 @@ def _persist_dismissal_verdict(node_id: str, route, verdict) -> None:
         print(f"[{node_id}] could not persist '{route}' verdict: {exc}", file=sys.stderr)
 
 
+def _coerce_finding_verdicts(verdict) -> list[dict]:
+    """Normalizes the optional per-finding verdict list into plain dicts.
+
+    A live run pushed 14 findings through ONE campaign-level ReviewVerdict:
+    a single review opinion covered 14 independent vulnerabilities, so one
+    bad call either dismissed or promoted all of them at once. The extended
+    ReviewVerdict (core.config) lets the reviewer return one entry per
+    finding; this helper accepts the pydantic object, its dict dump, or the
+    parsed model JSON, because the classifier receives whichever of those
+    forms survived the output_key/session-state round-trip.
+
+    Returns [] whenever the field is absent, empty, or unusable. The empty
+    list IS the INV-6 fail-safe contract: the classifier then falls back to
+    campaign-level routing and persistence exactly as before this field
+    existed, so old workflows, old models, and refusal fallbacks lose
+    nothing.
+    """
+    raw = None
+    if isinstance(verdict, dict):
+        raw = verdict.get("finding_verdicts")
+    elif hasattr(verdict, "finding_verdicts"):
+        raw = getattr(verdict, "finding_verdicts")
+    if not raw or not isinstance(raw, (list, tuple)):
+        return []
+
+    entries: list[dict] = []
+    for item in raw:
+        if isinstance(item, dict):
+            fid = item.get("finding_id")
+            route = item.get("route")
+            reason = item.get("reason")
+        else:
+            fid = getattr(item, "finding_id", None)
+            route = getattr(item, "route", None)
+            reason = getattr(item, "reason", None)
+        if not isinstance(route, str) or not route.strip():
+            # An entry with no route can neither be routed nor persisted;
+            # dropping it (rather than failing the batch) keeps the other
+            # findings' verdicts alive.
+            continue
+        try:
+            fid = int(fid)
+        except (TypeError, ValueError):
+            # Identifier the DB cannot address. The entry still counts for
+            # the aggregate route below, but persistence will skip it.
+            fid = None
+        entries.append({
+            "finding_id": fid,
+            # Statuses are lowercase everywhere in the pipeline; normalize
+            # here once so persistence and routing agree on the vocabulary.
+            "route": route.lower().strip(),
+            "reason": str(reason or ""),
+        })
+    return entries
+
+
+def _persist_finding_dismissals(node_id: str, entries: list[dict]) -> None:
+    """Records each per-finding dismissal individually, deterministically.
+
+    Same contract as _persist_dismissal_verdict, applied per finding instead
+    of per campaign: statuses are lowercase, verdicts whose reason begins
+    with "Fallback:" are routed but NEVER persisted (route it, never learn
+    it), persistence is best-effort (a DB hiccup must not kill the
+    campaign), and update_status's monotonic guard -- not this code -- keeps
+    dismissals from ever overwriting dynamic proof.
+
+    core.database.update_status addresses findings by FILEPATH, not by id,
+    so a dismissal stamp lands on every active finding recorded at that
+    path. Two guards keep that honest:
+
+      * a filepath that also hosts a finding PROMOTED in this same verdict
+        set is never stamped -- the stamp would erase the promotion the
+        reviewer just made; and
+      * a filepath is stamped only when every still-active finding at it is
+        covered by a dismissal entry, so a sibling the reviewer never ruled
+        on cannot be dismissed by mere proximity. Uncovered findings stay
+        `reported`, which is precisely the pre-P6 behaviour for ALL
+        findings, so the guard can only reduce over-recording, never add it.
+    """
+    dismissals = [
+        e for e in entries
+        if e["route"] in _DISMISSAL_ROUTES
+        and not e["reason"].lstrip().startswith("Fallback:")
+    ]
+    if not dismissals:
+        return
+    try:
+        from core.context import current_run_context
+        rc = current_run_context.get()
+        if rc is None or not rc.db_path or not rc.run_id:
+            return
+        from core.database import read_findings, update_status
+
+        # Findings whose status is already in this set cannot be altered by
+        # a dismissal stamp (update_status's terminal clauses refuse), so
+        # they do not count as "active" when deciding whether a filepath is
+        # fully covered by the reviewer's dismissals.
+        protected = {
+            "false_positive", "non_viable", "duplicate_merged",
+            "sample_or_test", "mitigated", "dynamic_confirmed",
+            "patch_verified",
+        }
+        fp_by_id: dict[int, str] = {}
+        active_ids_by_fp: dict[str, set] = {}
+        for f in read_findings(rc.db_path, run_id=rc.run_id):
+            try:
+                f_id = int(f.get("id"))
+            except (TypeError, ValueError):
+                continue
+            fp = str(f.get("filepath") or "")
+            fp_by_id[f_id] = fp
+            if str(f.get("status") or "").lower() not in protected:
+                active_ids_by_fp.setdefault(fp, set()).add(f_id)
+
+        promoted_fps = {
+            fp_by_id[e["finding_id"]]
+            for e in entries
+            if e["route"] not in _DISMISSAL_ROUTES and e["finding_id"] in fp_by_id
+        }
+        dismissed_ids = {e["finding_id"] for e in dismissals if e["finding_id"] is not None}
+
+        stamped_fps: set = set()
+        for e in dismissals:
+            fp = fp_by_id.get(e["finding_id"], "") if e["finding_id"] is not None else ""
+            if not fp or fp in promoted_fps or fp in stamped_fps:
+                continue
+            if active_ids_by_fp.get(fp, set()) - dismissed_ids:
+                # An active sibling at this path carries no verdict of its
+                # own; stamping the path would judge a finding nobody
+                # reviewed.
+                continue
+            stamped_fps.add(fp)
+            try:
+                update_status(rc.db_path, fp, rc.run_id, e["route"])
+            except Exception as exc:
+                print(
+                    f"[{node_id}] could not persist '{e['route']}' for finding {e['finding_id']}: {exc}",
+                    file=sys.stderr,
+                )
+    except Exception as exc:
+        print(f"[{node_id}] per-finding dismissal persistence skipped: {exc}", file=sys.stderr)
+
+
+def _derive_campaign_route(entries: list[dict]) -> str:
+    """Aggregates per-finding verdicts into the single campaign route.
+
+    Any promoted finding routes the campaign forward: promotion means at
+    least one vulnerability still needs the downstream stages, and the
+    dismissed siblings were already recorded individually by
+    _persist_finding_dismissals, so nothing is lost by moving on. Only when
+    EVERY entry is a dismissal does the campaign route to dismissal; the
+    modal dismissal route wins (first-seen breaks ties) so a
+    13-false_positive / 1-non_viable split reads as the false_positive
+    campaign it substantively is.
+    """
+    for e in entries:
+        if e["route"] not in _DISMISSAL_ROUTES:
+            return e["route"]
+    counts: dict[str, int] = {}
+    order: list[str] = []
+    for e in entries:
+        r = e["route"]
+        if r not in counts:
+            order.append(r)
+        counts[r] = counts.get(r, 0) + 1
+    return max(order, key=lambda r: counts[r])
+
+
+def _make_completion_stamp_callback(node_id: str, on_enter_status: str):
+    """Builds an after-agent callback that stamps coverage on SUCCESS only.
+
+    The stamp used to fire the moment the node's name first appeared in the
+    event stream -- on entry, before the node had done any work. A campaign
+    that crashed mid-node had therefore already stamped its target (e.g.
+    `static_confirmed` on reproducer entry): the coverage ledger claimed the
+    scan happened when it demonstrably did not finish. A crashed campaign
+    must not stamp its target as covered/scanned.
+
+    ADK's after_agent_callback runs only after the agent's _run_async_impl
+    completed without raising (exceptions propagate out of run_async before
+    _handle_after_agent_callback is reached), so anchoring the stamp here
+    converts it from "the node was entered" to "the node actually finished".
+
+    The two guards main.py applied at entry time are preserved verbatim:
+    dynamic statuses (`dynamic_confirmed`, `patch_verified`) still require
+    ctx.sandbox_executed -- a node that never reached a sandbox cannot claim
+    dynamic proof, INV-1 -- and persistence stays best-effort: a DB hiccup
+    must not kill the campaign. Statuses are lowercase; update_status
+    enforces the vocabulary and its own monotonic terminal clauses.
+    """
+    new_status = str(on_enter_status).lower().strip()
+
+    def _stamp_on_success(callback_context=None, **_kwargs):
+        try:
+            from core.context import current_run_context
+            rc = current_run_context.get()
+            if rc is None or not rc.db_path or not rc.run_id or not rc.target_file:
+                return None
+            if new_status in ("dynamic_confirmed", "patch_verified") and not rc.sandbox_executed:
+                return None
+            from core.database import update_status
+            update_status(rc.db_path, rc.target_file, rc.run_id, new_status)
+        except Exception as exc:
+            print(
+                f"[{node_id}] could not stamp completion status '{new_status}': {exc}",
+                file=sys.stderr,
+            )
+        # None: no content override, no state delta -- the callback is a
+        # pure side effect and must not alter the event stream.
+        return None
+
+    return _stamp_on_success
+
+
 def create_classifier(node_id: str, routes: list[str], max_visits: int = 1):
+
     async def _classify(ctx: Context, node_input: Any = None):
         state_key = f"{node_id}_visits"
         visits = ctx.state.get(state_key, 0) + 1
@@ -218,11 +434,27 @@ def create_classifier(node_id: str, routes: list[str], max_visits: int = 1):
         if isinstance(route, str):
             route = route.lower().strip()
 
-        # Persisted on the PARSED route, before any routing decision: dismissal
-        # routes are deliberately undeclared in workflow.json (they fall through
-        # DEFAULT_ROUTE to the calibrator), so a declared-routes-only hook would
-        # never see them -- which is precisely how they went unrecorded before.
-        _persist_dismissal_verdict(node_id, route, verdict)
+        # Per-finding verdicts (P6). A live run pushed 14 findings through ONE
+        # campaign-level ReviewVerdict, so a single review opinion silently
+        # covered 14 independent vulnerabilities. When the reviewer supplies
+        # the optional finding_verdicts list, each finding's dismissal is
+        # recorded individually and the campaign route is DERIVED from the
+        # aggregate (any promotion routes forward; all-dismissed routes to the
+        # modal dismissal), overriding the top-level route field -- the
+        # aggregate is computed from per-finding judgments and is therefore
+        # strictly better informed than the single summary route. An empty or
+        # absent list is the INV-6 fail-safe: fall through to the pre-P6
+        # campaign-level persistence and routing below, unchanged.
+        finding_entries = _coerce_finding_verdicts(verdict)
+        if finding_entries:
+            _persist_finding_dismissals(node_id, finding_entries)
+            route = _derive_campaign_route(finding_entries)
+        else:
+            # Persisted on the PARSED route, before any routing decision: dismissal
+            # routes are deliberately undeclared in workflow.json (they fall through
+            # DEFAULT_ROUTE to the calibrator), so a declared-routes-only hook would
+            # never see them -- which is precisely how they went unrecorded before.
+            _persist_dismissal_verdict(node_id, route, verdict)
 
         if max_visits and max_visits > 1 and visits >= max_visits:
             return adk.Event(output=node_input, state={state_key: visits}, route="exceeded")
@@ -772,23 +1004,45 @@ def load_workflow_from_json(
 
         if isinstance(node_cfg, AgentNode):
             node_has_error = False
+            # The exact call graph build used to make eagerly, frozen as a
+            # zero-argument resolver so it can run either here (normal path)
+            # or inside DeferredEnvLiteLlm at first LLM call (hermetic path).
+            # Freezing the arguments NOW matters: spec/node config is loop
+            # state that must not be re-read later through a stale closure.
+            llm_kwargs_resolver = functools.partial(
+                get_llm_kwargs,
+                node_cfg.model,
+                spec.config.default_model,
+                api_base=node_cfg.api_base,
+                default_api_base=spec.config.api_base,
+                timeout=node_cfg.timeout,
+                default_timeout=spec.config.timeout,
+                reasoning_effort=node_cfg.reasoning_effort,
+                default_reasoning_effort=spec.config.reasoning_effort,
+                global_model_override=model_override,
+                config=spec.config.model_dump(),
+            )
+            deferred_env = False
+            llm_kwargs = {}
             try:
-                _, llm_kwargs = get_llm_kwargs(
-                    node_cfg.model,
-                    spec.config.default_model,
-                    api_base=node_cfg.api_base,
-                    default_api_base=spec.config.api_base,
-                    timeout=node_cfg.timeout,
-                    default_timeout=spec.config.timeout,
-                    reasoning_effort=node_cfg.reasoning_effort,
-                    default_reasoning_effort=spec.config.reasoning_effort,
-                    global_model_override=model_override,
-                    config=spec.config.model_dump(),
-                )
+                _, llm_kwargs = llm_kwargs_resolver()
+            except ValueError as e:
+                if "VERTEXAI_PROJECT or GOOGLE_CLOUD_PROJECT" in str(e):
+                    # Missing cloud credentials, and ONLY missing cloud
+                    # credentials, defer to call time. Building a graph is
+                    # pure local data flow; holding a GCP project is only
+                    # needed to actually call the model. Coupling them made 9
+                    # hermetic tests fail at build time without ever intending
+                    # an LLM call. Every other error (unknown model syntax,
+                    # bad timeout, malformed config) still fails the build
+                    # here, loudly -- deferral is not a general error dump.
+                    deferred_env = True
+                else:
+                    errors.append(f"Node {node_id}: {str(e)}")
+                    node_has_error = True
             except Exception as e:
                 errors.append(f"Node {node_id}: {str(e)}")
                 node_has_error = True
-                llm_kwargs = {}
 
             instruction = ""
             agent_tools = []
@@ -814,6 +1068,21 @@ def load_workflow_from_json(
                 if schema_cls is None:
                     errors.append(f"Node {node_id}: unknown output_schema '{node_cfg.output_schema}'")
                     node_has_error = True
+                elif node_cfg.output_schema == "ReviewVerdict" and ExtendedReviewVerdict is not None:
+                    # P6: bind the extended schema so the reviewer CAN return
+                    # per-finding verdicts. This must happen at bind time, not
+                    # in response sanitization: ADK re-validates the agent's
+                    # final text against the bound schema class
+                    # (validate_schema -> model_validate_json), and the
+                    # canonical ReviewVerdict is extra="forbid" -- a response
+                    # carrying finding_verdicts would be rejected by the
+                    # runtime itself before any harness code saw it. The
+                    # extended model's finding_verdicts defaults to [], so
+                    # every wire-format-valid ReviewVerdict remains valid
+                    # unchanged (INV-6); when config could not define the
+                    # extended model, the canonical schema stays bound and
+                    # behavior is exactly pre-P6.
+                    schema_cls = ExtendedReviewVerdict
 
             if node_has_error:
                 continue
@@ -823,8 +1092,21 @@ def load_workflow_from_json(
             if guard_text not in instruction:
                 instruction = f"{instruction.rstrip()}\n\n{guard_text}"
 
-            if node_id == "calibrator" or (node_cfg.skill and "mantis-calibrate" in node_cfg.skill):
+            # One model instance per node, built here so the calibrator path
+            # and the regular agent path share the hermetic deferral: when
+            # credentials were missing at build time, DeferredEnvLiteLlm
+            # carries the frozen resolver and runs it (fail-closed) on the
+            # first real LLM call; the model string passed at construction is
+            # only a display placeholder until then.
+            if deferred_env:
+                model_inst = DeferredEnvLiteLlm(
+                    model=str(node_cfg.model or spec.config.default_model or DEFAULT_MODEL),
+                    env_resolver=llm_kwargs_resolver,
+                )
+            else:
                 model_inst = LiteLlm(**llm_kwargs)
+
+            if node_id == "calibrator" or (node_cfg.skill and "mantis-calibrate" in node_cfg.skill):
                 nodes[node_id] = create_calibrator_node(
                     node_id=node_id,
                     llm_model=model_inst,
@@ -844,10 +1126,32 @@ def load_workflow_from_json(
                     f"(e.g. do NOT write 'verdict.json', 'done.txt', or 'status.json'). Also do NOT run probe shell commands "
                     f"(e.g. do NOT run 'echo done', 'echo 1', 'true', or 'exit 0')."
                 )
+                if node_cfg.output_schema == "ReviewVerdict" and schema_cls is ExtendedReviewVerdict:
+                    # P6: one verdict per finding. A live run pushed 14
+                    # findings through ONE campaign-level verdict, so a single
+                    # review opinion silently judged 14 independent
+                    # vulnerabilities. The instruction rides here -- the
+                    # harness-owned instruction seam -- rather than in the
+                    # skill prompt, because it describes the OUTPUT CONTRACT
+                    # of this binding, and it is only appended when the
+                    # extended schema is actually bound: telling the model to
+                    # emit finding_verdicts against the strict schema would
+                    # make ADK reject every response.
+                    instruction = (
+                        f"{instruction}\n\n"
+                        f"PER-FINDING VERDICTS: Each finding returned by get_findings is an INDEPENDENT "
+                        f"vulnerability claim and deserves its own judgment. When more than one finding is "
+                        f"in scope, your verdict JSON MUST include a \"finding_verdicts\" list with exactly one "
+                        f"entry per finding: {{\"finding_id\": <numeric id from get_findings>, \"route\": "
+                        f"\"confirmed\" | \"false_positive\", \"reason\": \"<one sentence for THIS finding>\"}}. "
+                        f"Never let one finding's weakness dismiss its siblings, and never let one finding's "
+                        f"strength confirm them. The top-level route/reason then summarize the overall outcome "
+                        f"(confirmed if ANY finding is confirmed)."
+                    )
 
             agent_kwargs: dict[str, Any] = {
                 "name": node_id,
-                "model": LiteLlm(**llm_kwargs),
+                "model": model_inst,
                 "instruction": instruction,
                 "tools": agent_tools,
                 "output_schema": schema_cls,
@@ -857,6 +1161,24 @@ def load_workflow_from_json(
                 agent_kwargs["include_contents"] = node_cfg.include_contents
             else:
                 agent_kwargs["include_contents"] = "none"
+
+            if node_cfg.on_enter_status:
+                # P4: coverage stamps fire on successful node COMPLETION, not
+                # entry. main.py used to stamp the moment a node's name first
+                # appeared in the event stream -- i.e. before the node did any
+                # work -- so a campaign that crashed mid-reproducer had
+                # already stamped its target static_confirmed: a crashed
+                # campaign must not stamp its target as covered/scanned. ADK
+                # runs after_agent_callback only when _run_async_impl
+                # completed without raising (base_agent.run_async lets
+                # exceptions propagate before _handle_after_agent_callback),
+                # which makes it exactly the "this node actually finished"
+                # signal the entry stamp only pretended to be. The
+                # on_enter_status map exported to main.py is emptied below so
+                # the old entry-time stamp cannot double-fire.
+                agent_kwargs["after_agent_callback"] = _make_completion_stamp_callback(
+                    node_id, node_cfg.on_enter_status
+                )
 
             agent = adk.Agent(**agent_kwargs)
             node_retry = (
@@ -975,13 +1297,15 @@ def load_workflow_from_json(
         for item in edge_map.values()
     ]
 
-    node_status_map = {
-        node_cfg.id: node_cfg.on_enter_status
-        for node_cfg in spec.nodes
-        if isinstance(node_cfg, AgentNode) and node_cfg.on_enter_status is not None
-    }
     cfg = spec.config.model_dump()
-    cfg["on_enter_status"] = node_status_map
+    # P4: exported EMPTY on purpose. Coverage stamps moved into each stamped
+    # agent's after_agent_callback (see _make_completion_stamp_callback), which
+    # fires only after the node body completed without an exception. main.py
+    # still consumes cfg["on_enter_status"] and stamps at node ENTRY -- the
+    # exact behavior that let a crashed campaign mark its target as scanned --
+    # so the map it receives must be empty. The key itself stays present
+    # because it is part of the config contract main.py reads unconditionally.
+    cfg["on_enter_status"] = {}
     if spec.budget:
         cfg["budget"] = spec.budget
     elif "budget" in raw_json and isinstance(raw_json["budget"], dict):

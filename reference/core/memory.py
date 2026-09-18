@@ -42,6 +42,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import posixpath
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -84,6 +86,116 @@ def _clip(text: Any, limit: int = _MAX_PROSE_CHARS) -> str:
 
 def _is_str(value: Any) -> bool:
     return isinstance(value, str) and bool(value.strip())
+
+
+# --- Target scoping for recall ----------------------------------------------------
+#
+# Whether a stored finding belongs to the target being recalled is decided at PATH
+# COMPONENT boundaries, never by substring. The substring test this replaces matched
+# bidirectionally ("target in stored or stored in target"), which made a target of
+# `lib` claim findings in `librandom/x.py` and `foo/lib.bak` -- unrelated areas whose
+# names merely share letters. A false match here is not cosmetic: recall output is
+# EVIDENCE handed to a planner, so a finding attributed to the wrong area directs
+# attention (and budget) somewhere the evidence never pointed. The discipline below
+# mirrors cost.uncovered_files(): a path P belongs to target T iff P == T, or P is
+# under the directory T (P startswith T + "/"), or T is under the directory P
+# (T startswith P + "/") -- and nothing else. On any ambiguity the answer is "no
+# match": recall returning too little costs a planner one hint, recall returning too
+# much launders another area's history into this one.
+
+
+def _canonicalize_for_match(path: str) -> str:
+    """Puts one side of the containment comparison into the stored representation.
+
+    Stored filepaths were canonicalized at WRITE time by database.canonical_filepath,
+    which relativizes absolute paths against the jail directory of the run that wrote
+    them. The `target` recall receives is usually an ABSOLUTE path (main.py passes
+    resolved scan targets), so comparing it raw against repo-relative rows can never
+    succeed. Routing both sides through the same chokepoint at COMPARE time makes the
+    two representations meet: when a run context exists (per-campaign recall runs
+    inside the scan loop, after the context is set) the absolute target relativizes
+    against the live jail exactly as the stored rows once did; without a context the
+    cwd fallback applies, and failing both the path simply stays absolute -- which the
+    matcher then treats as unprovable rather than guessing.
+
+    Returns "" for the tree root (a path that relativizes to nothing IS the root),
+    matching canonical_filepath's own convention. Never raises: a canonicalizer that
+    cannot be imported degrades to lexical normalization, because recall must never
+    cost the run (INV-6).
+    """
+    s = str(path or "").strip().replace("\\", "/")
+    if s.startswith("file://"):
+        s = s[7:]
+    while s.startswith("./"):
+        s = s[2:]
+    if not s or s == "/":
+        return ""
+    try:
+        from core.database import canonical_filepath
+
+        # target_file is deliberately EMPTY. Passing the path as its own target_file
+        # (the pattern database.py uses at its call sites) adds the path itself to the
+        # relativization bases, so any absolute path self-relativizes to "" -- and ""
+        # means tree root here, i.e. "matches everything". For a matcher that must
+        # fail toward FEWER matches, that is the wrong degradation: with no
+        # target_file the only bases are the run's jail directory and the cwd, and a
+        # path neither can place stays absolute, which _matches_target treats as
+        # unprovable containment rather than universal containment.
+        s = canonical_filepath(s, target_file="")
+    except Exception:
+        # Degraded path: no relativization, but the component-boundary rule still
+        # applies to whatever representation we have. Strictly fewer matches than
+        # the canonicalized path would produce -- the safe direction.
+        s = posixpath.normpath(s)
+    s = s.rstrip("/")
+    if s == ".":
+        return ""
+    return s
+
+
+def _matches_target(stored: str, canon_target: str) -> bool:
+    """Whether a stored finding path belongs to the recall target, boundary-safe.
+
+    `canon_target` must already have been through _canonicalize_for_match (it is
+    computed once per recall, not once per row). The stored side is canonicalized
+    here, per row, because legacy rows can carry an absolute path -- written when
+    canonical_filepath could not relativize -- and compare-time canonicalization is
+    the one chance to bring such a row back into the current tree's frame.
+    """
+    canon_stored = _canonicalize_for_match(stored)
+
+    if not canon_stored:
+        # A finding with no recorded location, or one filed against the tree root
+        # itself. The previous filter deliberately let these through (`if stored and
+        # ...`), and that stands: a whole-tree finding pertains to every area of the
+        # tree, and excluding it would make root-level history invisible to every
+        # target-scoped recall forever.
+        return True
+
+    if not canon_target:
+        # The target IS the tree root. Every row that relativized into the tree is
+        # inside it by construction. A row that stayed ABSOLUTE after compare-time
+        # canonicalization could not be placed in this tree at all -- different
+        # checkout, different machine, or a write-time bug -- and containment for it
+        # is unprovable. Unprovable means no match, not maybe.
+        return not os.path.isabs(canon_stored)
+
+    if os.path.isabs(canon_stored) != os.path.isabs(canon_target):
+        # One side rooted, the other relative, and canonicalization could not unify
+        # them. Any answer here would be a guess about which root the relative side
+        # meant; the fail direction for recall is FEWER matches.
+        return False
+
+    # The component-boundary rule itself, identical in spirit to
+    # cost.uncovered_files(): equality, or ancestry in either direction, with the
+    # separator pinned so `lib` can never claim `librandom` or `foo/lib.bak`.
+    if canon_stored == canon_target:
+        return True
+    if canon_stored.startswith(canon_target + "/"):
+        return True
+    if canon_target.startswith(canon_stored + "/"):
+        return True
+    return False
 
 
 # --- Coverage ledger -------------------------------------------------------------
@@ -266,6 +378,10 @@ def recall(
     dismissed: List[Dict[str, Any]] = []
     lineage_counts: Dict[str, Dict[str, Any]] = {}
 
+    # Canonicalized once, outside the row loop: the target does not change per row,
+    # and _canonicalize_for_match may consult the run context on every call.
+    canon_target = _canonicalize_for_match(target) if target else ""
+
     for row in rows:
         if not isinstance(row, dict):
             continue
@@ -280,13 +396,16 @@ def recall(
         # row silently fell out of memory -- worse than being wrong, it was gone.
         status = status.strip().lower()
 
-        # Filter to the target when one is given. A substring test is deliberate: stored
-        # filepaths are canonicalized relative to whatever root that run used, so an
-        # absolute-path equality test silently returns nothing when the same repository
-        # is audited from a different directory.
+        # Filter to the target when one is given. Matching happens at path COMPONENT
+        # boundaries after both sides pass through the same canonicalization the
+        # writer used (see _matches_target): stored filepaths are repo-relative while
+        # the caller's target is usually absolute, so the comparison has to unify
+        # representations rather than test raw strings. The substring test that used
+        # to live here matched `lib` against `librandom/x.py` and `foo/lib.bak`,
+        # handing this target another area's evidence; the boundary rule refuses both.
         if target:
             stored = str(row.get("filepath") or "")
-            if stored and target not in stored and stored not in target:
+            if not _matches_target(stored, canon_target):
                 continue
 
         entry = {

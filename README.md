@@ -38,7 +38,13 @@ python3 scripts/configure.py --test --probe
 # 3. Launch Vulnerability Review Campaign (file or repository)
 ./run.sh path/to/code            # a file or a directory
 
-# 4. (Optional) Run Research Graph Synthesis for a Specific Objective
+# 4. (Optional) Tell the planner what to hunt for, in plain language (standard pipeline)
+./run.sh path/to/code --focus "look for IDOR"
+
+# 5. (Optional) Remove spend limits for long unattended runs
+./run.sh path/to/code --no-budget --parallel 32
+
+# 6. (Optional) Research Graph Synthesis: designs a new agent-graph topology for your objective
 ./run.sh path/to/code --objective "Audit for Server-Side Request Forgery and SSRF in webhook handlers"
 ```
 

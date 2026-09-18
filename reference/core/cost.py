@@ -313,16 +313,25 @@ def observed_campaign_cost(
         with conn:
             _ensure_table(conn)
             cur = conn.cursor()
+            # `tokens > 0` is stated alongside the credibility floor, not left to
+            # it: multi-target campaigns stamp member coverage as zero-token
+            # ledger rows (metadata member_of) purely so uncovered_files() sees
+            # them covered. Those rows are bookkeeping, not observations --
+            # averaging them in would drag the observed campaign cost toward
+            # zero and inflate every affordability estimate. The floor happens
+            # to exclude them today, but it is a tunable credibility threshold,
+            # and the member-stamp exclusion must not depend on its value.
             if scan_mode:
                 cur.execute(
-                    "SELECT tokens FROM campaign_spend WHERE scan_mode = ? AND tokens >= ? "
+                    "SELECT tokens FROM campaign_spend WHERE scan_mode = ? "
+                    "AND tokens > 0 AND tokens >= ? "
                     "ORDER BY id DESC LIMIT ?",
                     (str(scan_mode), _MIN_CREDIBLE_OBSERVATION, int(limit)),
                 )
                 rows = [r[0] for r in cur.fetchall()]
             if not rows:
                 cur.execute(
-                    "SELECT tokens FROM campaign_spend WHERE tokens >= ? "
+                    "SELECT tokens FROM campaign_spend WHERE tokens > 0 AND tokens >= ? "
                     "ORDER BY id DESC LIMIT ?",
                     (_MIN_CREDIBLE_OBSERVATION, int(limit)),
                 )
@@ -336,7 +345,11 @@ def observed_campaign_cost(
             except sqlite3.Error:
                 pass
 
-    clean = [int(r) for r in rows if isinstance(r, (int, float)) and r >= _MIN_CREDIBLE_OBSERVATION]
+    clean = [
+        int(r)
+        for r in rows
+        if isinstance(r, (int, float)) and r > 0 and r >= _MIN_CREDIBLE_OBSERVATION
+    ]
     if not clean:
         return (None, 0)
     return (int(sum(clean) / len(clean)), len(clean))
@@ -383,6 +396,15 @@ def estimate_scan(
     except (TypeError, ValueError):
         spendable = 0
 
+    # A ceiling of 0 means the token budget is DISABLED, not that nothing is
+    # affordable: without this, `spendable // cost` reads an unlimited budget
+    # as "covers ~0 campaigns" -- the exact opposite of what the operator said.
+    unbounded = False
+    try:
+        unbounded = int(max_tokens) <= 0
+    except (TypeError, ValueError):
+        pass
+
     # Name the files big enough to distort their own campaign. Rare, but at the
     # extreme a single file is half the default budget, and an operator who is
     # told "200 campaigns" deserves to know one of them is a 20 MB generated blob.
@@ -395,7 +417,10 @@ def estimate_scan(
         if len(oversized) >= 10:
             break
 
-    affordable = spendable // cost if cost > 0 else planned
+    if unbounded:
+        affordable = planned
+    else:
+        affordable = spendable // cost if cost > 0 else planned
     return ScanEstimate(
         planned_campaigns=planned,
         affordable_campaigns=int(affordable),

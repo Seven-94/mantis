@@ -101,7 +101,7 @@ except Exception:
 
 try:
     from google.adk.models.lite_llm import LiteLlm, LiteLLMClient, LlmCapabilities
-    from pydantic import Field
+    from pydantic import Field, PrivateAttr
 except Exception:
     LiteLlm = object
     LiteLLMClient = object
@@ -112,6 +112,66 @@ except Exception:
         if callable(factory):
             return factory()
         return kwargs.get("default", None)
+
+    def PrivateAttr(**kwargs: Any) -> Any:
+        return kwargs.get("default", None)
+
+
+# ---------------------------------------------------------------------------
+# P6: Per-finding review verdicts.
+#
+# A live run pushed 14 findings through ONE campaign-level ReviewVerdict: a
+# single {route, reason} pair silently judged 14 independent vulnerabilities,
+# so one review opinion either promoted or dismissed all of them at once.
+# ExtendedReviewVerdict mirrors core.schemas.ReviewVerdict exactly (route,
+# reason, extra="forbid") and adds an OPTIONAL finding_verdicts list carrying
+# one verdict per finding id. It lives HERE rather than in core.schemas
+# because the ADK runtime re-validates the agent's final response text against
+# the bound output schema (google.adk.utils._schema_utils.validate_schema uses
+# model_validate_json), and the canonical ReviewVerdict is extra="forbid":
+# binding the strict schema while asking the reviewer for finding_verdicts
+# would turn every extended response into an ADK validation error. The strict
+# schema in core.schemas stays untouched as the wire-compatibility baseline
+# (INV-6): when this class cannot be defined, graph_loader keeps the canonical
+# schema and behavior is exactly pre-P6.
+try:
+    from typing import Literal as _Literal
+    from pydantic import BaseModel as _PydanticBaseModel, ConfigDict as _PydanticConfigDict
+
+    class FindingVerdict(_PydanticBaseModel):
+        """One reviewer verdict for ONE finding (see ExtendedReviewVerdict)."""
+
+        # extra="ignore" and route-as-plain-str are deliberate leniency: a
+        # single malformed entry must never invalidate the 13 well-formed
+        # sibling verdicts beside it in the same response. The classifier's
+        # coercion layer lowercases routes, drops entries it cannot use, and
+        # only ever persists the known dismissal vocabulary -- an unknown
+        # route can therefore route conservatively but can never be learned.
+        model_config = _PydanticConfigDict(extra="ignore")
+        finding_id: int = Field(description="The numeric finding id exactly as returned by get_findings.")
+        route: str = Field(description="'confirmed' or 'false_positive' for THIS finding only.")
+        reason: str = Field(default="", description="One sentence justifying this finding's verdict.")
+
+    class ExtendedReviewVerdict(_PydanticBaseModel):
+        """Structured reviewer verdict with optional per-finding verdicts (P6)."""
+
+        model_config = _PydanticConfigDict(extra="forbid")
+        route: _Literal["confirmed", "false_positive"]
+        reason: str = Field(description="One sentence justifying the verdict.")
+        # The empty-list default IS the fail-safe contract (INV-6): an absent
+        # or empty list means campaign-level routing and persistence exactly
+        # as before this field existed, so old prompts, old models, replayed
+        # sessions, and synthesized refusal fallbacks lose nothing.
+        finding_verdicts: list[FindingVerdict] = Field(
+            default_factory=list,
+            description=(
+                "One verdict per finding id from get_findings. "
+                "Empty list = the top-level verdict applies to the whole campaign."
+            ),
+        )
+except Exception:  # pragma: no cover - only when pydantic itself is absent
+    FindingVerdict = None
+    ExtendedReviewVerdict = None
 
 DEFAULT_MODEL = "vertex_ai/gemini-3.7-flash"
 SUPPORTED_SANDBOXES = ("static-only", "static", "gvisor", "microsandbox", "gce")
@@ -1082,8 +1142,18 @@ class ResilientLiteLlm(LiteLlm):
             schema_name = getattr(schema_cls, "__name__", str(schema_cls))
             if schema_name == "ReproVerdict":
                 hint = '{"route": "success" | "failed_repro", "reason": "<explanation>"}'
-            elif schema_name == "ReviewVerdict":
-                hint = '{"route": "confirmed" | "false_positive", "reason": "<explanation>"}'
+            elif schema_name in ("ReviewVerdict", "ExtendedReviewVerdict"):
+                # Per-finding verdicts (P6): the hint shows the optional
+                # finding_verdicts list so the reviewer judges each finding id
+                # individually instead of pushing every finding on the target
+                # through one campaign-level route.
+                hint = (
+                    '{"route": "confirmed" | "false_positive", "reason": "<explanation>", '
+                    '"finding_verdicts": [{"finding_id": <id from get_findings>, '
+                    '"route": "confirmed" | "false_positive", "reason": "<one sentence>"}, ...]} '
+                    '-- include one finding_verdicts entry PER finding id when multiple findings exist; '
+                    'omit or leave the list empty only when there is a single finding or none'
+                )
             elif schema_name == "CriticVerdict":
                 hint = '{"route": "viable" | "non_viable", "reason": "<explanation>"}'
             else:
@@ -1319,17 +1389,28 @@ class ResilientLiteLlm(LiteLlm):
                     "route": "failed_repro",
                     "reason": f"Fallback: {clean_snippet}",
                 }
-            elif schema_name == "ReviewVerdict":
+            elif schema_name in ("ReviewVerdict", "ExtendedReviewVerdict"):
                 # Fail CLOSED like the other two verdicts. The old value
                 # ("confirmed") promoted a safety-blocked or garbage response
                 # into a confirmed vulnerability and sent it down the
                 # critic/repro chain. The "Fallback:" reason prefix is a
                 # contract with the classifier: synthesized dismissals are
-                # routed but never persisted as finding status.
+                # routed but never persisted as finding status. The explicit
+                # empty finding_verdicts list is the same contract at the
+                # per-finding level (INV-6): a synthesized verdict reviewed
+                # nothing, so it must route campaign-level and can never
+                # stamp any individual finding.
                 fallback_payload = {
                     "route": "false_positive",
                     "reason": f"Fallback: {clean_snippet}",
                 }
+                if schema_name == "ExtendedReviewVerdict":
+                    # Only the extended schema tolerates this key: the
+                    # canonical ReviewVerdict is extra="forbid" and ADK
+                    # re-validates this synthesized text against the bound
+                    # schema, so adding the key there would turn the
+                    # fail-safe itself into a validation error.
+                    fallback_payload["finding_verdicts"] = []
             elif schema_name == "CriticVerdict":
                 fallback_payload = {
                     "route": "non_viable",
@@ -1491,6 +1572,70 @@ class ResilientLiteLlm(LiteLlm):
                     flush=True,
                 )
                 await asyncio.sleep(delay)
+
+
+class DeferredEnvLiteLlm(ResilientLiteLlm):
+    """ResilientLiteLlm that resolves cloud credentials at CALL time, not build time.
+
+    get_llm_kwargs raises when a vertex_ai/ model has no resolvable project
+    (VERTEXAI_PROJECT / GOOGLE_CLOUD_PROJECT / ADC), and graph_loader used to
+    call it eagerly for every node while BUILDING the graph. That coupled two
+    unrelated capabilities: constructing the workflow graph (pure local data
+    flow) and holding cloud credentials (only needed to actually call the
+    model). In hermetic environments -- unit tests, CI sandboxes, air-gapped
+    graph review -- 9 tests failed at import/build time without ever intending
+    to make an LLM call.
+
+    This class carries a zero-argument resolver (a functools.partial closing
+    over the exact same arguments graph_loader would have passed eagerly) and
+    invokes it on the FIRST generate_content_async call. Resolution is
+    fail-closed: if the environment still lacks credentials at call time, the
+    resolver re-raises the same clear ValueError ("You must set
+    VERTEXAI_PROJECT or GOOGLE_CLOUD_PROJECT...") with build-deferral context
+    appended -- the call fails loudly, never silently downgrades to another
+    provider. If the environment gained credentials between build and call
+    (main.py setup, test fixtures, delayed ADC), resolution simply succeeds.
+    """
+
+    _env_resolver: Any = PrivateAttr(default=None)
+    _env_resolved: bool = PrivateAttr(default=True)
+
+    def __init__(self, model: str, env_resolver: Any = None, **kwargs: Any) -> None:
+        super().__init__(model=model, **kwargs)
+        self._env_resolver = env_resolver
+        self._env_resolved = env_resolver is None
+
+    def _resolve_deferred_env(self) -> None:
+        if self._env_resolved:
+            return
+        try:
+            resolved_model, llm_kwargs = self._env_resolver()
+        except ValueError as e:
+            # Same message the eager path produced, so operators and tests
+            # that match on it keep working; the suffix explains why it
+            # surfaced at call time instead of graph-build time.
+            raise ValueError(
+                f"{e} (credential resolution was deferred from graph build; "
+                f"this LLM call for '{getattr(self, 'model', '?')}' cannot proceed without them)"
+            ) from e
+        merged = dict(llm_kwargs)
+        merged.pop("model", None)
+        try:
+            # The construction-time model string was a display placeholder
+            # (raw node/config id); swap in the fully resolved id now.
+            self.model = resolved_model
+        except Exception:
+            pass
+        additional = getattr(self, "_additional_args", None)
+        if isinstance(additional, dict):
+            additional.update(merged)
+        self._env_resolver = None
+        self._env_resolved = True
+
+    async def generate_content_async(self, llm_request: Any, stream: bool = False) -> Any:
+        self._resolve_deferred_env()
+        async for item in super().generate_content_async(llm_request, stream=stream):
+            yield item
 
 
 def get_llm_kwargs(

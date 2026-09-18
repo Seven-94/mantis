@@ -10,9 +10,12 @@ case "$OS" in
         # Standard Linux environment (including WSL2)
         ;;
     Darwin)
-        echo "WARNING: macOS (Darwin) detected. MicroVM / KVM hardware virtualization is unsupported on macOS."
-        echo "         Dynamic reproduction requires a container runtime or setting sandbox.type to 'static-only'"
-        echo "         in workflow.json for static-only analysis."
+        if [ "$(uname -m)" = "arm64" ]; then
+            echo "macOS (Apple Silicon) detected: microsandbox microVMs run via Hypervisor.framework."
+        else
+            echo "WARNING: macOS on Intel is unsupported for microVM isolation."
+            echo "         Set sandbox.type to 'static-only' in workflow.json for static-only analysis."
+        fi
         ;;
     CYGWIN*|MINGW*|MSYS*)
         echo "ERROR: Native Windows is not supported due to shell and virtualenv layout differences (.venv/Scripts vs .venv/bin)." >&2
@@ -76,9 +79,29 @@ else
     done
 
     if [ "$BUILD_SUCCESS" -eq 0 ]; then
-        echo "WARNING: failed to build sandbox image with any available builder (buildah, podman, docker)."
-        echo "         Dynamic reproduction needs the sandbox image; install one and re-run ./install.sh,"
-        echo "         or set sandbox.type to 'gvisor' or 'static-only' in workflow.json."
+        # Fallback: no container builder on this host (typical macOS dev
+        # machine). Pull a pinned base image straight into the microsandbox
+        # cache instead. This is the only time a pull happens -- the runtime
+        # always boots with PullPolicy.NEVER. Keep this list in sync with
+        # MICROSANDBOX_FALLBACK_IMAGES in scripts/configure.py.
+        # mirror.gcr.io first: some networks block Docker Hub.
+        PULL_SUCCESS=0
+        for img in "mirror.gcr.io/library/python:3-slim" "docker.io/library/python:3-slim"; do
+            echo "No container builder found; pulling base image '$img' into the sandbox cache..."
+            if .venv/bin/msb image pull "$img"; then
+                PULL_SUCCESS=1
+                echo "Successfully cached '$img'. Auto-configure will select it as the guest image."
+                break
+            else
+                echo "Pulling '$img' failed; trying next mirror if available..."
+            fi
+        done
+
+        if [ "$PULL_SUCCESS" -eq 0 ]; then
+            echo "WARNING: could not build (buildah, podman, docker) or pull a sandbox guest image."
+            echo "         Dynamic reproduction needs a cached guest image; fix network/registry access"
+            echo "         and re-run ./install.sh, or set sandbox.type to 'static-only' in workflow.json."
+        fi
     fi
 fi
 

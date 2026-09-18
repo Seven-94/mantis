@@ -477,8 +477,8 @@ SCENARIOS = {
     # scores as potent off the matrix self-check alone while pinning nothing.
     "cost_revert_credibility_floor": [
         ('core/cost.py',
-         '    clean = [int(r) for r in rows if isinstance(r, (int, float)) and r >= _MIN_CREDIBLE_OBSERVATION]',
-         '    clean = [int(r) for r in rows if isinstance(r, (int, float))]  # NEUTERED: crashed campaigns make campaigns look cheap'),
+         '    clean = [\n        int(r)\n        for r in rows\n        if isinstance(r, (int, float)) and r > 0 and r >= _MIN_CREDIBLE_OBSERVATION\n    ]',
+         '    clean = [int(r) for r in rows if isinstance(r, (int, float)) and r > 0]  # NEUTERED: crashed campaigns make campaigns look cheap'),
         ('core/cost.py',
          '                    (str(scan_mode), _MIN_CREDIBLE_OBSERVATION, int(limit)),',
          '                    (str(scan_mode), 0, int(limit)),  # NEUTERED'),
@@ -488,7 +488,7 @@ SCENARIOS = {
     ],
     "cost_revert_mode_isolation": [
         ('core/cost.py',
-         '            if scan_mode:\n                cur.execute(\n                    "SELECT tokens FROM campaign_spend WHERE scan_mode = ? AND tokens >= ? "\n                    "ORDER BY id DESC LIMIT ?",\n                    (str(scan_mode), _MIN_CREDIBLE_OBSERVATION, int(limit)),\n                )\n                rows = [r[0] for r in cur.fetchall()]',
+         '            if scan_mode:\n                cur.execute(\n                    "SELECT tokens FROM campaign_spend WHERE scan_mode = ? "\n                    "AND tokens > 0 AND tokens >= ? "\n                    "ORDER BY id DESC LIMIT ?",\n                    (str(scan_mode), _MIN_CREDIBLE_OBSERVATION, int(limit)),\n                )\n                rows = [r[0] for r in cur.fetchall()]',
          '            pass  # NEUTERED: cheap file scans make subsystem scans look affordable'),
     ],
     "cost_revert_sizing_lowers_only": [
@@ -1138,6 +1138,184 @@ SCENARIOS = {
          "            if key in VERDICT_FIELDS:",
          "            if False:  # NEUTERED: verdict fields pass through untouched"),
     ],
+
+    # ---- R2: per-campaign budget guard resets ----
+    "budget_revert_campaign_step_scope": [
+        ("core/budget.py",
+         "        if self.campaign_graph_steps >= self.config.max_graph_steps:",
+         "        if self.graph_steps >= self.config.max_graph_steps:"
+         "  # NEUTERED: cumulative ceiling again"),
+    ],
+    "budget_revert_begin_campaign_reset": [
+        ("core/budget.py",
+         "        self.campaign_graph_steps = 0\n"
+         "        self.campaign_llm_calls = 0\n"
+         "        # Node visit and per-visit tool counters are loop detectors scoped to a\n"
+         "        # single campaign's graph traversal. Clearing the visit counts also\n"
+         "        # resets the visit-index component of the node_tool_counts keys, so the\n"
+         "        # dict is cleared with it to keep the two in step.\n"
+         "        self.node_visit_counts = {}\n"
+         "        self.node_tool_counts = {}",
+         "        pass  # NEUTERED: begin_campaign resets nothing"),
+    ],
+
+    # ---- P6: per-finding review verdicts ----
+    "verdict_revert_per_finding_persistence": [
+        ("core/graph_loader.py",
+         "            _persist_finding_dismissals(node_id, finding_entries)",
+         "            pass  # NEUTERED: per-finding dismissals never persisted"),
+    ],
+    "verdict_revert_promoted_path_guard": [
+        ("core/graph_loader.py",
+         "            if not fp or fp in promoted_fps or fp in stamped_fps:\n"
+         "                continue\n"
+         "            if active_ids_by_fp.get(fp, set()) - dismissed_ids:\n"
+         "                # An active sibling at this path carries no verdict of its\n"
+         "                # own; stamping the path would judge a finding nobody\n"
+         "                # reviewed.\n"
+         "                continue",
+         "            if not fp or fp in stamped_fps:"
+         "  # NEUTERED: promoted-path and sibling-coverage guards removed\n"
+         "                continue"),
+    ],
+
+    # ---- P4: success-only coverage stamps ----
+    "stamp_revert_success_only": [
+        ("core/graph_loader.py",
+         '    cfg["on_enter_status"] = {}',
+         '    cfg["on_enter_status"] = {\n'
+         "        n.id: n.on_enter_status\n"
+         "        for n in spec.nodes\n"
+         '        if getattr(n, "on_enter_status", None)\n'
+         "    }  # NEUTERED: entry-time stamp map re-exported to main.py"),
+    ],
+
+    # ---- R4: recall boundary matching ----
+    "recall_revert_boundary_matching": [
+        ("core/memory.py",
+         "    if canon_stored == canon_target:\n"
+         "        return True\n"
+         '    if canon_stored.startswith(canon_target + "/"):\n'
+         "        return True\n"
+         '    if canon_target.startswith(canon_stored + "/"):\n'
+         "        return True\n"
+         "    return False",
+         "    return (canon_target in canon_stored) or (canon_stored in canon_target)"
+         "  # NEUTERED: bidirectional substring matching"),
+    ],
+
+    # ---- P4-sentinel: reached-sink evidence chokepoint ----
+    "sentinel_revert_any_command_counts": [
+        ("tools/sandbox_tools.py",
+         "        evidence_present, _reason = check_reached_sink_evidence(\n"
+         "            output=output,\n"
+         "            exit_code=exit_code,\n"
+         "            sink_symbol=sink_symbol,\n"
+         "            sentinel_content=sentinel_content,\n"
+         "        )\n"
+         "        if evidence_present:\n"
+         "            ctx.sandbox_executed = True",
+         "        if exit_code != 127:\n"
+         "            ctx.sandbox_executed = True"
+         "  # NEUTERED: any command that ran counts as dynamic evidence"),
+    ],
+
+    # ---- H-3: planner deterministic gates ----
+    "planner_revert_path_gate": [
+        ("core/planner.py",
+         '                candidate = text if text.startswith("/") else str(base / text)\n'
+         "                resolved, _ = validate_scan_target(candidate)\n"
+         "                if resolved is None:\n"
+         "                    rejected_paths += 1\n"
+         "                    continue\n"
+         "                try:\n"
+         "                    resolved.relative_to(base)\n"
+         "                except ValueError:\n"
+         "                    rejected_paths += 1\n"
+         "                    continue",
+         '                candidate = text if text.startswith("/") else str(base / text)\n'
+         "                resolved, _ = validate_scan_target(candidate)\n"
+         "                if resolved is None:\n"
+         "                    rejected_paths += 1\n"
+         "                    continue\n"
+         "                # NEUTERED: relative_to(base) containment check removed"),
+    ],
+    "planner_revert_fail_safe": [
+        ("core/planner.py",
+         "            if is_auth_error(call_err) or isinstance(\n"
+         "                call_err, (MantisAuthError, BudgetExceededError)\n"
+         "            ):\n"
+         "                raise",
+         "            if is_auth_error(call_err) or isinstance(call_err, MantisAuthError):\n"
+         "                raise  # NEUTERED: BudgetExceededError degrades to the empty plan"),
+    ],
+
+    # ---- H-4: dynamic replanning fail-safes ----
+    "replan_revert_zero_campaign_floor": [
+        ("core/planner.py",
+         '        if not gated.get("available") or not gated.get("groups"):\n'
+         "            return empty\n"
+         "        return gated",
+         '        if not gated.get("available") or not gated.get("groups"):\n'
+         '            return {**empty, "available": True}'
+         "  # NEUTERED: an empty replan reads as applied and cancels remaining work\n"
+         "        return gated"),
+    ],
+
+    # ---- H-5: operator steering trust split ----
+    "steer_revert_focus_cap_strip": [
+        ("core/planner.py",
+         "        return strip_terminal_control(text)[:_MAX_FOCUS_CHARS].strip()",
+         "        return text"
+         "  # NEUTERED: control characters ride an operator focus into every prompt"),
+    ],
+    "steer_revert_seed_fence_omission": [
+        ("core/planner.py",
+         "    except Exception as exc:\n"
+         "        # No fence, no section: this content must never reach a prompt unfenced.\n"
+         '        logger.warning("Seed report fencing failed; omitting section: %s", exc)\n'
+         '        return ""',
+         "    except Exception as exc:\n"
+         '        logger.warning("Seed report fencing failed: %s", exc)\n'
+         "        fenced = seed"
+         "  # NEUTERED: raw seed bytes travel unfenced on fencing failure"),
+    ],
+
+    # ---- H-6: chain lifecycle refutation asymmetry ----
+    "chain_revert_dismissal_only_refutation": [
+        ("core/chains.py",
+         '                elif route == "dismissal" and link["status"] != "supported":',
+         '                elif link["status"] != "supported":'
+         "  # NEUTERED: any zero-finding campaign now refutes touched links"),
+    ],
+
+    # ---- H-7: zero-token member stamps stay out of the observed average ----
+    "cost_revert_zero_token_exclusion": [
+        ("core/cost.py",
+         '                    "AND tokens > 0 AND tokens >= ? "',
+         '                    "AND tokens >= ? "'),
+        ("core/cost.py",
+         '                    "SELECT tokens FROM campaign_spend WHERE tokens > 0 AND tokens >= ? "',
+         '                    "SELECT tokens FROM campaign_spend WHERE tokens >= ? "'),
+        ("core/cost.py",
+         "                    (str(scan_mode), _MIN_CREDIBLE_OBSERVATION, int(limit)),",
+         "                    (str(scan_mode), 0, int(limit)),"),
+        ("core/cost.py",
+         "                    (_MIN_CREDIBLE_OBSERVATION, int(limit)),",
+         "                    (0, int(limit)),"),
+        ("core/cost.py",
+         "        if isinstance(r, (int, float)) and r > 0 and r >= _MIN_CREDIBLE_OBSERVATION",
+         "        if isinstance(r, (int, float))"
+         "  # NEUTERED: zero-token member stamps drag the observed average toward zero"),
+    ],
+
+    # ---- H-8: multi-target member coverage stamping ----
+    "coverage_revert_member_stamping": [
+        ("main.py",
+         '        for member in (group.get("targets") or [])[1:]:',
+         "        for member in []:"
+         "  # NEUTERED: members are never stamped; coverage math lies"),
+    ],
 }
 
 
@@ -1176,7 +1354,14 @@ def run_matrix(only_scenarios=None):
         # matrix for a test that cannot be neutered by any scenario here.
         matrix_env = dict(os.environ, MANTIS_NEUTER_MATRIX="1")
         proc = subprocess.run(
-            [PY, "-m", "unittest", "tests.test_security_regression", "-v"],
+            [
+                PY, "-m", "unittest",
+                "tests.test_security_regression",
+                "tests.test_budget_planner",
+                "tests.test_verdicts_recall_sentinel",
+                "tests.test_chains_groups",
+                "-v",
+            ],
             cwd=dst, capture_output=True, text=True, env=matrix_env,
         )
         combined = proc.stdout + proc.stderr
