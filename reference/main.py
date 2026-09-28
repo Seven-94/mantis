@@ -8,7 +8,7 @@ import dataclasses
 import subprocess
 import warnings
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 # Suppress noisy ADK preview/experimental feature notices
 warnings.filterwarnings("ignore", message=r".*\[EXPERIMENTAL\].*")

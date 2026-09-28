@@ -33,8 +33,9 @@ import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-# Suppress spurious OpenTelemetry context-detach tracebacks caused by Python 3.14
-# contextvars strict isolation when an async generator pauses or cancels mid-stream.
+# Suppress spurious OpenTelemetry context-detach tracebacks caused by contextvars
+# isolation when an async generator pauses or cancels mid-stream (most visible on
+# Python 3.14; the filter is harmless on older supported versions).
 class _OTelContextFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         return "Failed to detach context" not in record.getMessage()

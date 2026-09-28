@@ -28,8 +28,8 @@ case "$OS" in
 esac
 
 # --- Python Version Gate ---
-if ! python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 14) else 1)' 2>/dev/null; then
-    echo "ERROR: Mantis requires Python 3.14 or newer." >&2
+if ! python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)' 2>/dev/null; then
+    echo "ERROR: Mantis requires Python 3.12 or newer." >&2
     echo "       Current interpreter: $(python3 --version 2>&1 || echo 'none')" >&2
     exit 1
 fi

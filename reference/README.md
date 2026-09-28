@@ -6,9 +6,10 @@ top of the **Agent Development Kit (ADK)** using the full suite of canonical
 
 ## Getting Started
 
-First, install python3-venv such as with `sudo apt install python3-venv`, then
-run the install script. Mantis comes with automated configuration and launcher
-tools (`mantis-configure` and `mantis-launch`):
+Mantis requires **Python 3.12 or newer**. First, install python3-venv such as
+with `sudo apt install python3-venv`, then run the install script. Mantis comes
+with automated configuration and launcher tools (`mantis-configure` and
+`mantis-launch`):
 
 ```bash
 cd reference && ./install.sh
