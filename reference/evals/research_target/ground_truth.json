@@ -1,0 +1,77 @@
+{
+  "format_version": "1.0",
+  "target": "research_target",
+  "notes": "Ground truth for the researcher-stage evaluation (evals/research_eval.py). Seven seeded findings across six files; five require connecting a source in app.py to a sink in another file (cross_file=true), which is the headline capability structural navigation tools are expected to improve. This file is EXCLUDED from the copy of the target placed in the eval jail, so the model never sees the answers. A finding matches an entry when its filepath matches any entry in 'files' AND its title+description mention any phrase in 'match_any' (case-insensitive substring).",
+  "findings": [
+    {
+      "id": "sqli-find-user",
+      "files": ["database.py", "app.py"],
+      "sink": "database.py:find_user",
+      "source": "app.py:/api/user",
+      "cwe": "CWE-89",
+      "class": "sql_injection",
+      "cross_file": true,
+      "match_any": ["sql injection", "sqli", "cwe-89", "sql query", "query interpolation"]
+    },
+    {
+      "id": "traversal-fetch-document",
+      "files": ["storage.py", "app.py"],
+      "sink": "storage.py:fetch_document",
+      "source": "app.py:/docs/view",
+      "cwe": "CWE-22",
+      "class": "path_traversal",
+      "cross_file": true,
+      "match_any": ["path traversal", "directory traversal", "cwe-22", "arbitrary file read", "../"]
+    },
+    {
+      "id": "cmdi-run-backup",
+      "files": ["admintools.py", "app.py"],
+      "sink": "admintools.py:run_backup",
+      "source": "app.py:/admin/backup",
+      "cwe": "CWE-78",
+      "class": "command_injection",
+      "cross_file": true,
+      "match_any": ["command injection", "shell injection", "cwe-78", "os.system", "arbitrary command"]
+    },
+    {
+      "id": "ssrf-preview",
+      "files": ["fetcher.py", "app.py"],
+      "sink": "fetcher.py:preview",
+      "source": "app.py:/api/preview",
+      "cwe": "CWE-918",
+      "class": "ssrf",
+      "cross_file": true,
+      "match_any": ["ssrf", "server-side request forgery", "cwe-918", "internal network", "urlopen"]
+    },
+    {
+      "id": "hardcoded-admin-token",
+      "files": ["auth.py"],
+      "sink": "auth.py:ADMIN_TOKEN",
+      "source": "auth.py",
+      "cwe": "CWE-798",
+      "class": "hardcoded_credentials",
+      "cross_file": false,
+      "match_any": ["hardcoded", "hard-coded", "cwe-798", "embedded credential", "static token", "static secret"]
+    },
+    {
+      "id": "weak-hash-md5",
+      "files": ["auth.py"],
+      "sink": "auth.py:hash_password",
+      "source": "auth.py",
+      "cwe": "CWE-916",
+      "class": "weak_password_hashing",
+      "cross_file": false,
+      "match_any": ["md5", "weak hash", "unsalted", "cwe-916", "cwe-327", "password hashing"]
+    },
+    {
+      "id": "timing-unsafe-token-compare",
+      "files": ["auth.py", "app.py"],
+      "sink": "auth.py:is_admin",
+      "source": "app.py:/admin/backup",
+      "cwe": "CWE-208",
+      "class": "timing_attack",
+      "cross_file": true,
+      "match_any": ["timing", "constant-time", "constant time", "cwe-208", "non-constant"]
+    }
+  ]
+}

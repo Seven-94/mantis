@@ -1,0 +1,85 @@
+{
+  "format_version": "1.0",
+  "target": "juice-shop",
+  "upstream": {
+    "repo": "https://github.com/juice-shop/juice-shop",
+    "tag": "v20.2.0",
+    "commit": "5658473cf8814459bf89000ce373b20ed0b4eb37",
+    "verified": "2026-10-03"
+  },
+  "notes": "Curated subset of OWASP Juice Shop's intentionally vulnerable files for the zero-LLM surveyor ranking benchmark, verified present at the pinned release above. Sources: the official challenge catalog (https://pwning.owasp-juice.shop). Entries were chosen for being unambiguous and stable across releases, not for completeness. A different checkout still runs but is flagged (commit_match=false), and files absent from it are reported as stale and excluded from scoring. Do not use this target for LLM-stage evals: its answers are public and pretraining contamination would inflate scores.",
+  "vulnerable_files": [
+    {
+      "id": "sqli-login",
+      "file": "routes/login.ts",
+      "class": "sql_injection",
+      "notes": "Login Admin challenge: credentials concatenated into a raw SQL query."
+    },
+    {
+      "id": "sqli-search",
+      "file": "routes/search.ts",
+      "class": "sql_injection",
+      "notes": "Database Schema / Christmas Special challenges: unsanitized search criteria in a raw query."
+    },
+    {
+      "id": "nosqli-track-order",
+      "file": "routes/trackOrder.ts",
+      "class": "nosql_injection",
+      "notes": "NoSQL order tracking injection via unsanitized order id."
+    },
+    {
+      "id": "nosqli-reviews-update",
+      "file": "routes/updateProductReviews.ts",
+      "class": "nosql_injection",
+      "notes": "NoSQL injection / forged review update without ownership check."
+    },
+    {
+      "id": "sleep-reviews-show",
+      "file": "routes/showProductReviews.ts",
+      "class": "nosql_injection",
+      "notes": "NoSQL sleep injection in product review lookup."
+    },
+    {
+      "id": "redirect-allowlist",
+      "file": "routes/redirect.ts",
+      "class": "open_redirect",
+      "notes": "Outdated allowlist / open redirect via to-parameter substring check."
+    },
+    {
+      "id": "upload-xxe-zipslip",
+      "file": "routes/fileUpload.ts",
+      "class": "xxe",
+      "notes": "XXE via uploaded XML and arbitrary write via zip slip during extraction."
+    },
+    {
+      "id": "ssrf-profile-image",
+      "file": "routes/profileImageUrlUpload.ts",
+      "class": "ssrf",
+      "notes": "SSRF via attacker-chosen profile image URL fetched server-side."
+    },
+    {
+      "id": "ssti-user-profile",
+      "file": "routes/userProfile.ts",
+      "class": "template_injection",
+      "notes": "Server-side template injection in the username rendered into the profile page."
+    },
+    {
+      "id": "rce-b2b-order",
+      "file": "routes/b2bOrder.ts",
+      "class": "code_injection",
+      "notes": "RCE via unsafe deserialization/eval of B2B order lines in a vm sandbox."
+    },
+    {
+      "id": "bola-basket",
+      "file": "routes/basket.ts",
+      "class": "broken_access_control",
+      "notes": "View Basket challenge: basket id taken from the request without ownership check."
+    },
+    {
+      "id": "weak-crypto-insecurity",
+      "file": "lib/insecurity.ts",
+      "class": "crypto_misuse",
+      "notes": "Hardcoded JWT keys, MD5 password hashing, and related helpers used across routes."
+    }
+  ]
+}

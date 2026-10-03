@@ -64,6 +64,12 @@ to create fewer vulnerabilities. To try it manually you can run the script:
 python3 scripts/advise.py --file path/to/file.py   # query accumulated knowledge
 ```
 
+## Benchmarks
+
+Benchmarks for the pipeline live in [`evals/`](evals/README.md): a
+deterministic, zero-LLM surveyor ranking benchmark and LLM stage evals
+(researcher, dedupe, review, critic, calibrate).
+
 ## Configuration & Launch Skills
 
 - **`mantis-configure`**

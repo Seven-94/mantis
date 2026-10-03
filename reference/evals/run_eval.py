@@ -220,7 +220,7 @@ async def eval_calibrator(model_id: str, effort: str, dataset_path: Path) -> Dic
         shutil.rmtree(temp_dir)
     return {"mae": mae, "priority_accuracy": prio_acc, "latency": latency}
 
-async def run_stage_benchmark(stage: str, models: List[tuple], runs: int = 1):
+async def run_stage_benchmark(stage: str, models: List[tuple], runs: int = 1, toolset: str = "baseline"):
     os.environ["VERTEXAI_LOCATION"] = os.environ.get("VERTEXAI_LOCATION", "global")
     evals_dir = Path(__file__).resolve().parent
     stage_dataset_map = {
@@ -228,6 +228,8 @@ async def run_stage_benchmark(stage: str, models: List[tuple], runs: int = 1):
         "review": evals_dir / "review_dataset.json",
         "critic": evals_dir / "critic_dataset.json",
         "calibrate": evals_dir / "calibrate_dataset.json",
+        # research carries its own target + ground truth pair; see research_eval.py.
+        "research": evals_dir / "research_target" / "ground_truth.json",
     }
     dataset_path = stage_dataset_map.get(stage)
     if not dataset_path or not dataset_path.exists():
@@ -237,6 +239,8 @@ async def run_stage_benchmark(stage: str, models: List[tuple], runs: int = 1):
     print(f"   MANTIS ADK EVALUATION BENCHMARK: Stage = {stage.upper()} ({runs} run(s) per configuration)")
     print("=" * 110)
     print(f"Dataset: {dataset_path.name}")
+    if stage == "research":
+        print(f"Toolset: {toolset}")
     print(f"Candidate Configurations: {len(models)}")
     print("-" * 110)
     summary_rows = []
@@ -249,6 +253,9 @@ async def run_stage_benchmark(stage: str, models: List[tuple], runs: int = 1):
             elif stage == "review": res = await eval_reviewer(model_id, effort, dataset_path)
             elif stage == "critic": res = await eval_critic(model_id, effort, dataset_path)
             elif stage == "calibrate": res = await eval_calibrator(model_id, effort, dataset_path)
+            elif stage == "research":
+                from evals.research_eval import eval_researcher
+                res = await eval_researcher(model_id, effort, toolset=toolset)
             else: res = {}
             run_results.append(res)
         latencies = [r.get("latency", 0.0) for r in run_results]
@@ -290,6 +297,23 @@ async def run_stage_benchmark(stage: str, models: List[tuple], runs: int = 1):
             row = {"model": short_name, "effort": effort, "avg_mae": f"{avg_mae:.2f}", "prio_acc": f"{avg_prio*100:.0f}%", "latency": f"{avg_lat:.2f}s ({min_lat:.1f}s-{max_lat:.1f}s)"}
             print(f"--> [CALIBRATE] MAE: {avg_mae:.2f} | Priority Acc: {avg_prio*100:.0f}% | Latency: {avg_lat:.2f}s")
             summary_rows.append(row)
+        elif stage == "research":
+            recalls = [r.get("recall", 0.0) for r in run_results]
+            cross = [r.get("cross_file_recall", 0.0) for r in run_results]
+            precisions = [r.get("precision", 0.0) for r in run_results]
+            token_counts = [r.get("total_tokens", 0) for r in run_results]
+            tptf = [r.get("tokens_per_detected") for r in run_results if r.get("tokens_per_detected")]
+            avg_rec = sum(recalls) / len(recalls) if recalls else 0.0
+            # Report worst-case recall across runs too: a configuration that
+            # only sometimes finds the cross-file bugs is not reliable.
+            worst_rec = min(recalls) if recalls else 0.0
+            avg_cross = sum(cross) / len(cross) if cross else 0.0
+            avg_prec = sum(precisions) / len(precisions) if precisions else 0.0
+            avg_tokens = sum(token_counts) / len(token_counts) if token_counts else 0
+            avg_tptf = sum(tptf) / len(tptf) if tptf else 0
+            row = {"model": short_name, "effort": effort, "avg_recall": f"{avg_rec*100:.0f}%", "worst_recall": f"{worst_rec*100:.0f}%", "cross_recall": f"{avg_cross*100:.0f}%", "avg_precision": f"{avg_prec*100:.0f}%", "tokens_per_detected": f"{avg_tptf:,.0f}" if avg_tptf else "n/a", "latency": f"{avg_lat:.2f}s ({min_lat:.1f}s-{max_lat:.1f}s)"}
+            print(f"--> [RESEARCH] Avg Rec: {avg_rec*100:.0f}% (worst {worst_rec*100:.0f}%) | Cross-file Rec: {avg_cross*100:.0f}% | Prec: {avg_prec*100:.0f}% | Tokens: {avg_tokens:,.0f} | Latency: {avg_lat:.2f}s")
+            summary_rows.append(row)
     print("\n" + "=" * 110)
     print(f"                    STAGE: {stage.upper()} BENCHMARK RESULTS SUMMARY ({runs} RUNS)")
     print("=" * 110)
@@ -313,23 +337,29 @@ async def run_stage_benchmark(stage: str, models: List[tuple], runs: int = 1):
         print("-" * 110)
         for r in summary_rows:
             print(f"{r['model']:<22} | {r['effort']:<6} | {r['avg_mae']:<15} | {r['prio_acc']:<13} | {r['latency']}")
+    elif stage == "research":
+        print(f"{'Model':<22} | {'Effort':<6} | {'Avg Rec':<8} | {'Worst Rec':<10} | {'XFile Rec':<10} | {'Avg Prec':<9} | {'Tok/Detected':<13} | {'Latency Distribution'}")
+        print("-" * 110)
+        for r in summary_rows:
+            print(f"{r['model']:<22} | {r['effort']:<6} | {r['avg_recall']:<8} | {r['worst_recall']:<10} | {r['cross_recall']:<10} | {r['avg_precision']:<9} | {r['tokens_per_detected']:<13} | {r['latency']}")
     print("=" * 110)
 
 async def main():
     parser = argparse.ArgumentParser(description="Run Mantis Multi-Stage Evaluation Benchmark")
-    parser.add_argument("--stage", type=str, default="dedupe", choices=["dedupe", "review", "critic", "calibrate", "all"], help="Target pipeline stage")
+    parser.add_argument("--stage", type=str, default="dedupe", choices=["dedupe", "review", "critic", "calibrate", "research", "all"], help="Target pipeline stage")
     parser.add_argument("--model", type=str, default=None, help="Specific model ID to evaluate")
     parser.add_argument("--effort", type=str, default=None, help="Reasoning effort level")
     parser.add_argument("--runs", type=int, default=3, help="Number of evaluation runs to compute distributions")
+    parser.add_argument("--toolset", type=str, default="baseline", help="Researcher toolset variant (research stage only); see research_eval.TOOLSETS")
     args = parser.parse_args()
     if args.model:
         efforts = [args.effort] if args.effort else ["low", "high"]
         models = [(args.model, eff) for eff in efforts]
     else:
         models = DEFAULT_MODELS
-    stages = ["dedupe", "review", "critic", "calibrate"] if args.stage == "all" else [args.stage]
+    stages = ["dedupe", "review", "critic", "calibrate", "research"] if args.stage == "all" else [args.stage]
     for s in stages:
-        await run_stage_benchmark(s, models, runs=args.runs)
+        await run_stage_benchmark(s, models, runs=args.runs, toolset=args.toolset)
 
 if __name__ == "__main__":
     asyncio.run(main())

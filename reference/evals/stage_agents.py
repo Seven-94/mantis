@@ -20,6 +20,14 @@ STAGE_OUTPUT_SCHEMAS = {
 }
 
 STAGE_CONFIGS = {
+    'researcher': {
+        'skill': 'mantis-researcher',
+        # Same tool list as the researcher node in workflow.json, so the eval
+        # measures the production toolset. research_eval.py can replace it
+        # via tools_override for toolset A/B runs.
+        'tools': ['read_file', 'write_file', 'list_files', 'get_summary', 'get_threat_model', 'get_plan', 'report_findings', 'get_findings'],
+        'instruction': 'You are the researcher stage in the Mantis review pipeline. Perform an in-depth code audit of the target to discover real, exploitable vulnerabilities. Trace data flow from untrusted sources to dangerous sinks, including flows that cross file boundaries, and report every distinct finding via report_findings with a precise title, filepath, line_numbers, and a description naming the end-to-end mechanism.'
+    },
     'deduplicator': {
         'skill': 'mantis-dedupe',
         'tools': ['read_file', 'write_file', 'get_findings', 'report_findings', 'dedupe_findings'],
@@ -62,15 +70,22 @@ STAGE_CONFIGS = {
     },
 }
 
-def build_stage_agent(stage_name: str, model_id: str = None, reasoning_effort: str = None):
+def build_stage_agent(stage_name: str, model_id: str = None, reasoning_effort: str = None, tools_override: list = None):
+    """Builds one pipeline stage as a standalone ADK agent for benchmarking.
+
+    ``tools_override`` replaces the stage's tool list for this build only
+    (used by research_eval.py for toolset A/B runs). Names still resolve
+    through tools.TOOLS, so an override cannot inject an unregistered tool.
+    """
     model_id = model_id or os.environ.get('EVAL_MODEL', 'vertex_ai/gemini-3.7-flash')
     reasoning_effort = reasoning_effort or os.environ.get('EVAL_REASONING_EFFORT', 'low')
     
     _, llm_kwargs = get_llm_kwargs(model_id=model_id, reasoning_effort=reasoning_effort)
     
     cfg = STAGE_CONFIGS.get(stage_name, {'skill': f'mantis-{stage_name}', 'tools': list(TOOLS.keys()), 'instruction': f'You are the {stage_name} stage.'})
+    tool_names = tools_override if tools_override is not None else cfg['tools']
     skill_path = Path(__file__).resolve().parent.parent.parent / cfg['skill']
-    tools_list = [TOOLS[t] for t in cfg['tools'] if t in TOOLS]
+    tools_list = [TOOLS[t] for t in tool_names if t in TOOLS]
     
     instruction = cfg['instruction']
     if skill_path.is_dir() and (skill_path / 'SKILL.md').exists():
