@@ -151,6 +151,46 @@ class ReadFindingsScopePathTest(_DbTest):
         self.assertNotIn("decoy-citation", self._titles("app"))
 
 
+class UpdateStatusScopeSymmetryTest(_DbTest):
+    """update_status must promote exactly what read_findings(scope_path=...)
+    lets the campaign see -- the two share _campaign_scope_clause."""
+
+    def setUp(self):
+        super().setUp()
+        write_findings(
+            self.db, "",
+            [
+                _finding("cross-dir", "server/lib/db.js",
+                         code_paths=["app/login.js:42", "server/lib/db.js:7"]),
+                _finding("decoy-citation", "lib/z.py",
+                         code_paths=["application/evil.py:3"]),
+                _finding("outside", "lib/util.py"),
+            ],
+            run_id="r1",
+        )
+
+    def test_campaign_stamp_promotes_cross_directory_finding(self):
+        # The app campaign reviewed and reproduced this finding (read_findings
+        # keeps it in scope via code_paths); the completion stamp must promote
+        # it too, or it stays "reported" and is suppressed at export.
+        update_status(self.db, "app", "r1", "static_confirmed")
+        self.assertEqual(_statuses_by_title(self.db)["cross-dir"], "static_confirmed")
+
+    def test_campaign_stamp_is_quote_anchored(self):
+        update_status(self.db, "app", "r1", "static_confirmed")
+        statuses = _statuses_by_title(self.db)
+        self.assertEqual(statuses["decoy-citation"], "reported")
+        self.assertEqual(statuses["outside"], "reported")
+
+    def test_stamp_scope_equals_read_scope(self):
+        update_status(self.db, "app", "r1", "static_confirmed")
+        promoted = {t for t, s in _statuses_by_title(self.db).items()
+                    if s == "static_confirmed"}
+        visible = {f["title"]
+                   for f in read_findings(self.db, run_id="r1", scope_path="app")}
+        self.assertEqual(promoted, visible)
+
+
 class GetFindingsCampaignScopeTest(_DbTest):
     def setUp(self):
         super().setUp()

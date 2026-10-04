@@ -459,6 +459,51 @@ def extract_target_symbol(title: str = "", description: str = "", code_paths: Op
     return ""
 
 
+def ground_symbol_in_catalog(db_path: str, filepath: str, line_numbers: str = "[]") -> str:
+    """The enclosing catalog function for a finding's first cited line, or "".
+
+    INV-3 lineage anchors on the target symbol, and `extract_target_symbol`
+    derives it from PROSE: retitle the same defect and the symbol moves, the
+    stable signature moves, and a fresh lineage is minted for a finding every
+    earlier run already tracked. When a structural index catalog exists (built
+    deterministically by the structural_index stage next to this database), the
+    innermost function enclosing filepath:line is a measurement of the CODE,
+    invariant to how any model phrased the title.
+
+    Returns the bare function name, lowercased -- the same shape the prose
+    extractor yields when a well-written title backticks the function -- so
+    grounding CONFIRMS the symbol for well-titled findings (signature unchanged
+    against existing databases) and corrects it only where prose and code
+    disagree. Returns "" when the catalog, the file, the line, or an unambiguous
+    match is missing; the caller keeps the prose symbol, so a deployment without
+    an index behaves exactly as before (INV-6). Never raises.
+    """
+    try:
+        if isinstance(line_numbers, str):
+            lines = json.loads(line_numbers or "[]")
+        else:
+            lines = list(line_numbers or [])
+        lines = [int(x) for x in lines if isinstance(x, (int, float)) and not isinstance(x, bool)]
+        if not lines or not str(filepath or "").strip():
+            return ""
+
+        from core.paths import resolve_db_path
+        from core.structural_index import StructuralIndex, state_dir_for_db
+
+        index = StructuralIndex(state_dir_for_db(resolve_db_path(db_path)))
+        if not index.available():
+            return ""
+        found = index.enclosing_symbol(str(filepath), min(lines))
+        if not found.get("found"):
+            return ""
+        qualified = str(found.get("qualified_name") or "").strip()
+        if not qualified:
+            return ""
+        return qualified.rsplit(".", 1)[-1].lower()
+    except Exception:
+        return ""
+
+
 def compute_stable_signature(
     filepath: str,
     title: str,
@@ -650,6 +695,13 @@ def write_findings(db_path: str, filepath: str, findings: list, run_id: str = ""
             raw_cwe = str(finding.get("cwe") or "")
             canonical_cwe = extract_canonical_cwe(raw_cwe, raw_title, raw_desc)
             target_symbol = extract_target_symbol(raw_title, raw_desc, finding.get("code_paths"))
+            # Ground the lineage symbol in the structural catalog where one
+            # exists: the enclosing function at filepath:line is invariant to
+            # prose, so a retitled re-report of the same defect keeps its
+            # signature and lineage. "" keeps the prose extraction above.
+            grounded_symbol = ground_symbol_in_catalog(db_path, finding_filepath, line_numbers)
+            if grounded_symbol:
+                target_symbol = grounded_symbol
 
             # Compute or extract deterministic stable content signature
             signature = str(finding.get("signature") or "").strip()
@@ -852,6 +904,35 @@ def _terminal_clause_for(status: str) -> str:
     return "AND LOWER(status) NOT IN ('duplicate_merged', 'false_positive', 'non_viable', 'sample_or_test', 'mitigated')"
 
 
+def _campaign_scope_clause(norm_path: str) -> "tuple[str, List[str]]":
+    """SQL predicate matching findings in a campaign's scope.
+
+    Scope is the exact path, its subtree, and findings whose code_paths cite
+    the path. code_paths is a JSON array of "path" / "path:line" strings; the
+    leading quote anchors each pattern to the start of a JSON string so
+    "app/" cannot match "application/". Shared by read_findings and
+    update_status so what a campaign can read and what its completion stamps
+    can promote never drift apart: a cross-directory finding the campaign
+    triaged must also be the finding its reproducer stamp confirms.
+    """
+    base = norm_path.rstrip("/") or norm_path
+    escaped = base.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    clause = (
+        "(filepath = ? OR filepath LIKE ? ESCAPE '\\'"
+        " OR code_paths LIKE ? ESCAPE '\\'"
+        " OR code_paths LIKE ? ESCAPE '\\'"
+        " OR code_paths LIKE ? ESCAPE '\\')"
+    )
+    params = [
+        base,
+        escaped + "/%",
+        '%"' + escaped + '"%',
+        '%"' + escaped + '/%',
+        '%"' + escaped + ':%',
+    ]
+    return clause, params
+
+
 def update_status(db_path: str, filepath: str, run_id: str, status: str):
     """Update status for active candidate findings under `filepath` in a given run
     (preserving terminal/suppressed statuses and preventing downgrades).
@@ -893,15 +974,14 @@ def update_status(db_path: str, filepath: str, run_id: str, status: str):
             """, (status, run_id))
             return
 
-        base = norm_fp.rstrip("/") or norm_fp
-        escaped = base.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        scope_clause, scope_params = _campaign_scope_clause(norm_fp)
         cursor.execute(f"""
             UPDATE findings
             SET status = ?
             WHERE run_id = ?
-              AND (filepath = ? OR filepath LIKE ? ESCAPE '\\')
+              AND {scope_clause}
               {terminal_clause}
-        """, (status, run_id, base, escaped + "/%"))
+        """, (status, run_id, *scope_params))
 
         # Upgrade OKF concepts trust tier on dynamic sandbox confirmation strictly for this specific resource
         if status in ("dynamic_confirmed", "patch_verified") and norm_fp and not os.path.isdir(norm_fp):
@@ -990,27 +1070,13 @@ def read_findings(
         if scope_path:
             norm_scope = canonical_filepath(scope_path, target_file=scope_path)
             if norm_scope and norm_scope not in (".", "/"):
-                base = norm_scope.rstrip("/") or norm_scope
-                escaped = base.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
                 # A cross-file finding can sit at a filepath outside the
-                # campaign scope while citing in-scope files in code_paths
-                # (a JSON array of "path" / "path:line" strings). Matching
-                # those keeps a slice's own cross-directory findings in
-                # scope; the leading quote anchors each pattern to the start
-                # of a JSON string so "app/" cannot match "application/".
-                query += (
-                    " AND (filepath = ? OR filepath LIKE ? ESCAPE '\\'"
-                    " OR code_paths LIKE ? ESCAPE '\\'"
-                    " OR code_paths LIKE ? ESCAPE '\\'"
-                    " OR code_paths LIKE ? ESCAPE '\\')"
-                )
-                params.extend([
-                    base,
-                    escaped + "/%",
-                    '%"' + escaped + '"%',
-                    '%"' + escaped + '/%',
-                    '%"' + escaped + ':%',
-                ])
+                # campaign scope while citing in-scope files in code_paths;
+                # the shared clause keeps those visible here and promotable
+                # by update_status.
+                scope_clause, scope_params = _campaign_scope_clause(norm_scope)
+                query += " AND " + scope_clause
+                params.extend(scope_params)
         if run_id:
             query += " AND run_id = ?"
             params.append(run_id)

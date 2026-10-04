@@ -359,6 +359,12 @@ class TestUntrustedContentFramingAndScrubbing(unittest.IsolatedAsyncioTestCase):
             "get_git_log",
             "get_git_diff",
             "run_sandbox",
+            # Structural navigation: listings and snippets are derived from
+            # target source, so they are scrubbed and wrapped like read_file.
+            "find_symbol",
+            "find_callers",
+            "find_callees",
+            "get_function_boundary",
         }
         returns_harness = {
             "write_file",
@@ -678,11 +684,15 @@ class TestInjectionGuardCoverage(unittest.TestCase):
                     f"Agent node '{node_name}' in workflow.json is missing the untrusted code audit guard",
                 )
 
-            # Assert node count coverage: 14 adk.Agent nodes + 1 custom calibrator node = 15 declared agent nodes
+            # Assert node count coverage: every declared agent node is either
+            # a captured adk.Agent carrying the guard, or one of the two
+            # deterministic interceptions (calibrator, structural_index) that
+            # make no LLM calls and so have no instruction to guard.
+            deterministic = {"calibrator", "structural_index"} & set(agent_nodes)
             self.assertEqual(
-                len(captured) + 1,
+                len(captured) + len(deterministic),
                 len(agent_nodes),
-                f"Expected {len(agent_nodes)} agent nodes, captured {len(captured)} + calibrator",
+                f"Expected {len(agent_nodes)} agent nodes, captured {len(captured)} + {sorted(deterministic)}",
             )
         finally:
             gl.adk.Agent = orig_agent
@@ -3814,7 +3824,13 @@ class TestSurveyorRankingQuality(unittest.TestCase):
         signals = [s["signals"] for s in astm["slices"]]
         inactive = set(astm["provenance"]["inactive_signals"])
 
-        for name in ("attack_surface", "churn", "boundaries", "language_risk"):
+        for name in (
+            "attack_surface",
+            "churn",
+            "boundaries",
+            "language_risk",
+            "cognitive_complexity",
+        ):
             if name in inactive:
                 # Declared dead and its weight redistributed: that is the handled case.
                 continue

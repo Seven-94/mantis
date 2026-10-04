@@ -4,6 +4,25 @@ Benchmarks for the reference pipeline, cheapest first. Tier 1 costs zero tokens;
 run it on every ranking change. Tier 2 costs one researcher campaign per
 configuration; run it when researcher tooling, prompts, or models change.
 
+## Tier intent
+
+Each tier answers one question in isolation, and a pass at one tier does not
+transfer upward: a ranking improvement (Tier 1) is not evidence of better
+detection (Tier 2), and a single-stage win is not evidence of an end-to-end win.
+Run the cheapest tier that can falsify the change being made.
+
+The downstream stage benchmarks
+(`run_eval.py --stage dedupe|review|critic|calibrate`) sit alongside Tier 2 at
+the same cost scale: fixed datasets, one stage judged in isolation per dataset
+row, so a regression is attributed to the stage that caused it rather than to
+the pipeline as a whole.
+
+There is deliberately no end-to-end tier yet. A full-pipeline score folds every
+stage's variance into one number, which can say "worse" without saying where;
+the stage benchmarks are that diagnostic layer. An end-to-end tier earns its
+spend only once a corpus is large enough to separate real movement from
+run-to-run noise, which the current seeded corpus is not.
+
 ## Tier 1 — Surveyor ranking benchmark (`surveyor_benchmark.py`)
 
 Deterministic, no LLM. Scores the Phase-0 ranked map against known vulnerable
@@ -47,8 +66,9 @@ Two caveats on the juice-shop ground truth:
 Measures the stage that produces findings: detection recall, cross-file recall,
 precision, and tokens per true finding over the seeded corpus in
 `research_target/` (ground truth is excluded from the eval jail). The toolset is
-the independent variable — `--toolset structural` picks up the structural
-navigation tools automatically once they are registered.
+the independent variable — `--toolset structural` adds the structural navigation
+tools (`find_symbol`, `find_callers`, `find_callees`, `get_function_boundary`),
+and the harness builds their tree-sitter catalog for the jail before the run.
 
 `research_target/` is a deliberately vulnerable, never-executed corpus. Do not
 "fix" its seeded flaws, and do not add comments that describe them: the files
@@ -64,6 +84,33 @@ python3 evals/run_eval.py --stage research --runs 3
 python3 evals/research_eval.py --model vertex_ai/gemini-3.7-flash \
     --effort low --toolset baseline --json-out /tmp/baseline.json
 ```
+
+### Field evidence: toolset A/B on an external target
+
+The seeded corpus measures recall; it cannot say whether the structural toolset
+finds bugs the baseline cannot. A two-round existence test (three runs per arm
+per round, same model and prompt in both arms) against a widely shipped
+~58k-line C driver subsystem — large enough that exhaustive reading does not fit
+in a context window; the specific target is withheld until the findings are
+verified fixed upstream — was scored by manually adjudicating every reported
+finding against the pinned source instead of by recall.
+
+Round-2 aggregates: baseline 2 real findings out of 9 reported (22% precision)
+at 10.7M tokens; structural 3 real out of 4 reported (75% precision) at 5.0M
+tokens. One real bug was found only by the structural arm, via a `find_callers`
+hop onto a call site passing an undersized caller buffer into an unchecked copy;
+zero of six baseline runs reported it although four had read the containing file
+in full. One real bug was found only by the baseline (an overflow visible in a
+single whole-file read), so the toolsets are complementary, not ordered. A
+macro-related false positive (indexing deleted by preprocessing, zero callers)
+was reported by every round-2 baseline run and by no run that actually used the
+index.
+
+Two operational caveats transfer to any rerun: models do not pick up the
+structural tools unprompted, so the researcher prompt must direct them to prefer
+function-level retrieval when the tools are present; and read-everything runs on
+large targets can re-read large files until they exhaust the context window, so
+cap tool calls or budget accordingly.
 
 ## Downstream stage benchmarks (`run_eval.py`)
 

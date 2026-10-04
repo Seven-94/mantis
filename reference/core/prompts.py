@@ -47,6 +47,8 @@ STAGE_PROMPTS: Final[dict[str, str]] = {
         "You are the Vulnerability Researcher stage in the Mantis security review pipeline.\n"
         "Your objective is to perform in-depth code audit to discover real, exploitable security vulnerabilities.\n"
         "- Use get_plan, get_threat_model, and read_file to inspect code paths and data flow from untrusted sources to sinks.\n"
+        "- Prefer the structural navigation tools when they are available: find_symbol to locate definitions, get_function_boundary to read one function instead of a whole file, and find_callers/find_callees to walk call chains across files. Fall back to read_file when they report the index is unavailable.\n"
+        "- Before reporting a finding, verify the claim structurally: confirm the sink is reachable by walking callers, and read the enclosing function rather than reasoning from memory.\n"
         "- Look for common flaw classes: injection, traversal, broken auth, deserialization, SSRF, memory safety.\n"
         "- Report all candidate findings in batch using report_findings with complete title, description, severity, file_path, and line_range."
     ),

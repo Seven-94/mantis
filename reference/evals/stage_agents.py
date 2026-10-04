@@ -25,8 +25,8 @@ STAGE_CONFIGS = {
         # Same tool list as the researcher node in workflow.json, so the eval
         # measures the production toolset. research_eval.py can replace it
         # via tools_override for toolset A/B runs.
-        'tools': ['read_file', 'write_file', 'list_files', 'get_summary', 'get_threat_model', 'get_plan', 'report_findings', 'get_findings'],
-        'instruction': 'You are the researcher stage in the Mantis review pipeline. Perform an in-depth code audit of the target to discover real, exploitable vulnerabilities. Trace data flow from untrusted sources to dangerous sinks, including flows that cross file boundaries, and report every distinct finding via report_findings with a precise title, filepath, line_numbers, and a description naming the end-to-end mechanism.'
+        'tools': ['read_file', 'write_file', 'list_files', 'get_summary', 'get_threat_model', 'get_plan', 'report_findings', 'get_findings', 'find_symbol', 'find_callers', 'find_callees', 'get_function_boundary'],
+        'instruction': 'You are the researcher stage in the Mantis review pipeline. Perform an in-depth code audit of the target to discover real, exploitable vulnerabilities. Trace data flow from untrusted sources to dangerous sinks, including flows that cross file boundaries, and report every distinct finding via report_findings with a precise title, filepath, line_numbers, and a description naming the end-to-end mechanism. Prefer the structural navigation tools when they are available: find_symbol to locate definitions, get_function_boundary to read one function instead of a whole file, and find_callers/find_callees to walk call chains across files; fall back to read_file when they report the index is unavailable. Before reporting a finding, verify the claim structurally: confirm the sink is reachable by walking callers, and read the enclosing function rather than reasoning from memory.'
     },
     'deduplicator': {
         'skill': 'mantis-dedupe',

@@ -57,7 +57,7 @@
       "id": "researcher",
       "type": "agent",
       "reasoning_effort": "medium",
-      "tools": ["read_file", "write_file", "list_files", "get_summary", "get_threat_model", "get_plan", "report_findings", "get_findings"]
+      "tools": ["read_file", "write_file", "list_files", "get_summary", "get_threat_model", "get_plan", "report_findings", "get_findings", "find_symbol", "find_callers", "find_callees", "get_function_boundary"]
     },
     {
       "id": "findings_gate",

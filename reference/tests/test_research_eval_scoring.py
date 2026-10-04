@@ -18,14 +18,21 @@ if _REF_ROOT not in sys.path:
     sys.path.insert(0, _REF_ROOT)
 
 from evals.research_eval import (
+    ABORT_GUARD_MIN_TOOL_CALLS,
+    ABORT_GUARD_PROMPT,
     DEFAULT_TARGET,
     GROUND_TRUTH_BASENAME,
     TOOLSETS,
+    TRANSCRIPT_PAYLOAD_LIMIT,
+    _clip,
     _copy_target,
+    count_event_tool_calls,
+    event_transcript_rows,
     extract_event_tokens,
     load_research_ground_truth,
     match_finding,
     score_research_findings,
+    should_rearm_run,
 )
 
 
@@ -179,10 +186,14 @@ class CorpusLeakTest(unittest.TestCase):
     )
 
     def test_corpus_files_do_not_leak_ground_truth(self):
-        for path in sorted(DEFAULT_TARGET.glob("*.py")):
+        corpus_files = sorted(DEFAULT_TARGET.rglob("*.py"))
+        self.assertGreater(len(corpus_files), 20, "corpus walk looks truncated")
+        for path in corpus_files:
             text = path.read_text(encoding="utf-8").lower()
             for marker in self.FORBIDDEN:
-                self.assertNotIn(marker, text, f"{path.name}: {marker!r}")
+                self.assertNotIn(
+                    marker, text, f"{path.relative_to(DEFAULT_TARGET)}: {marker!r}"
+                )
 
 
 class JailCopyTest(unittest.TestCase):
@@ -192,6 +203,8 @@ class JailCopyTest(unittest.TestCase):
             copied = sorted(p.name for p in app_dir.iterdir())
             self.assertIn("app.py", copied)
             self.assertIn("database.py", copied)
+            self.assertTrue((app_dir / "dal" / "repo.py").is_file())
+            self.assertTrue((app_dir / "web" / "orders_routes.py").is_file())
             self.assertNotIn(GROUND_TRUTH_BASENAME, copied)
 
 
@@ -243,6 +256,72 @@ class ToolsetContractTest(unittest.TestCase):
         self.assertEqual(resolved, TOOLSETS["baseline"])
         with self.assertRaises(ValueError):
             resolve_toolset("nonexistent")
+
+
+class AbortGuardTest(unittest.TestCase):
+    """The silent-abort re-arm: once, and only for runs that did nothing."""
+
+    def test_rearms_a_toolless_zero_finding_run(self):
+        self.assertTrue(should_rearm_run(0, 0, 0))
+        self.assertTrue(should_rearm_run(0, ABORT_GUARD_MIN_TOOL_CALLS - 1, 0))
+
+    def test_runs_that_reported_or_worked_score_as_they_stand(self):
+        self.assertFalse(should_rearm_run(1, 0, 0))
+        self.assertFalse(should_rearm_run(0, ABORT_GUARD_MIN_TOOL_CALLS, 0))
+
+    def test_never_rearms_twice(self):
+        self.assertFalse(should_rearm_run(0, 0, 1))
+
+    def test_nudge_demands_tools_not_prose(self):
+        for needle in ("list_files", "report_findings", "prose"):
+            self.assertIn(needle, ABORT_GUARD_PROMPT)
+
+    def test_tool_call_counter_never_raises(self):
+        call = types.SimpleNamespace(function_call=object(), text=None)
+        text = types.SimpleNamespace(function_call=None, text="plan...")
+        event = types.SimpleNamespace(
+            content=types.SimpleNamespace(parts=[call, text, call])
+        )
+        self.assertEqual(count_event_tool_calls(event), 2)
+        self.assertEqual(count_event_tool_calls(types.SimpleNamespace()), 0)
+        self.assertEqual(count_event_tool_calls(None), 0)
+
+
+class TranscriptRowsTest(unittest.TestCase):
+    """The JSONL trace a human reads to follow a run hop by hop."""
+
+    def test_rows_keep_order_and_kinds(self):
+        event = types.SimpleNamespace(
+            author="researcher",
+            content=types.SimpleNamespace(parts=[
+                types.SimpleNamespace(text="tracing the coupon flow",
+                                      function_call=None, function_response=None),
+                types.SimpleNamespace(text=None,
+                                      function_call=types.SimpleNamespace(
+                                          name="find_callers",
+                                          args={"symbol": "redeem"}),
+                                      function_response=None),
+                types.SimpleNamespace(text=None, function_call=None,
+                                      function_response=types.SimpleNamespace(
+                                          name="find_callers",
+                                          response={"result": "2 call site(s)"})),
+            ]),
+        )
+        rows = event_transcript_rows(event)
+        self.assertEqual([r["type"] for r in rows],
+                         ["text", "tool_call", "tool_response"])
+        self.assertEqual(rows[1]["name"], "find_callers")
+        self.assertIn("redeem", rows[1]["args"])
+        self.assertIn("call site", rows[2]["response"])
+
+    def test_clip_marks_what_it_cut(self):
+        clipped = _clip("x" * (TRANSCRIPT_PAYLOAD_LIMIT + 7), TRANSCRIPT_PAYLOAD_LIMIT)
+        self.assertIn("[clipped 7 chars]", clipped)
+        self.assertEqual(_clip("short", TRANSCRIPT_PAYLOAD_LIMIT), "short")
+
+    def test_malformed_event_yields_no_rows(self):
+        self.assertEqual(event_transcript_rows(None), [])
+        self.assertEqual(event_transcript_rows(types.SimpleNamespace()), [])
 
 
 if __name__ == "__main__":

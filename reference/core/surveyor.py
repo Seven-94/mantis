@@ -2,7 +2,7 @@
 
 Produces a ranked map of a repository ("which areas are worth auditing, in what
 order") *before* any model is involved. Nothing here calls an LLM; the ranking is a
-weighted formula over four measurable signals, so it is reproducible and reviewable.
+weighted formula over five measurable signals, so it is reproducible and reviewable.
 
 Why this exists
 ---------------
@@ -52,8 +52,8 @@ from core.paths import validate_scan_target
 
 logger = logging.getLogger(__name__)
 
-SURVEYOR_VERSION = "2.0"
-ASTM_SCHEMA_VERSION = "2.0"
+SURVEYOR_VERSION = "2.1"
+ASTM_SCHEMA_VERSION = "2.1"
 
 # --- Tuning -------------------------------------------------------------------------
 
@@ -76,6 +76,17 @@ _MAX_SAMPLED_FILES = 60_000
 _SAMPLE_FILES_PER_GROUP = 40
 _MAX_SCAN_BYTES = 64 * 1024
 
+# Complexity sampling bounds. Separate and smaller than the content-scan budget
+# because the cost structure differs by an order of magnitude: the pattern pass is
+# a regex over bytes, this pass is a full tree-sitter parse. At ~1-3ms per 64KB
+# file, the content budget's 60k ceiling would add minutes to an ELR-scale survey
+# for a signal that stabilizes on far fewer samples. Groups are visited in the
+# same cheap-rank order as the content scan, so when the budget runs out it is the
+# implausible tail that goes unmeasured, and complexity_sampled=0 makes the gap
+# visible in the ASTM rather than folding it into the score.
+_COMPLEXITY_FILES_PER_GROUP = 12
+_MAX_PARSED_FILES = 20_000
+
 # A group below this size is noise, not a subsystem.
 _MIN_GROUP_FILES = 5
 
@@ -94,10 +105,19 @@ _CHURN_GIT_TIMEOUT = 120.0
 
 # Signal weights (design §4.1). Redistributed by `_rebalance_weights` when a signal is
 # structurally inapplicable to the repository under survey.
-_W_SURFACE = 0.40
+#
+# Complexity's share comes out of attack surface and language risk rather than the
+# history signals: surface overlaps complexity most (both are content measurements,
+# and tangled request handling tends to match both), and language risk is the
+# weakest signal of the five -- a prior about the language, not a measurement of
+# this code. When tree-sitter or every grammar is absent the complexity signal is
+# uniformly zero and `_rebalance_weights` retires it, so the formula degrades to
+# the four-signal split rather than spending 10% on nothing.
+_W_SURFACE = 0.35
 _W_CHURN = 0.25
 _W_BOUNDARY = 0.20
-_W_LANGUAGE = 0.15
+_W_LANGUAGE = 0.10
+_W_COMPLEXITY = 0.10
 
 # Normalization percentile, and the population below which it degenerates to the max.
 _ROBUST_PERCENTILE = 0.95
@@ -432,6 +452,7 @@ class _Group:
     __slots__ = (
         "key", "files", "lang_counts", "manifest_count", "interface_count",
         "surface_score", "surface_tags", "scanned",
+        "complexity_total", "complexity_files", "function_total",
     )
 
     def __init__(self, key: str):
@@ -443,6 +464,11 @@ class _Group:
         self.surface_score = 0.0
         self.surface_tags: dict[str, float] = defaultdict(float)
         self.scanned = 0
+        # Filled by `_scan_group_complexity`: summed G over parsed files, how many
+        # files actually parsed, and how many named functions those files held.
+        self.complexity_total = 0
+        self.complexity_files = 0
+        self.function_total = 0
 
     @property
     def language(self) -> str:
@@ -719,6 +745,51 @@ def _scan_group_surface(
     return opened
 
 
+def _scan_group_complexity(group: _Group, budget: int) -> int:
+    """Pass 3: sampled tree-sitter parse for cognitive complexity. Returns files read.
+
+    Separate from `_scan_group_surface` rather than folded into it because the two
+    passes have different budgets and different failure modes: a regex table cannot
+    fail to load, a grammar can. The sample is strided across the sorted file list
+    for the same anti-alphabetical reason as the content scan.
+
+    Every degradation is per-file and silent by design: an unreadable file, a
+    missing grammar, or unparseable source skips that file and nothing else. Losing
+    the whole signal leaves it uniformly zero, which `_rebalance_weights` retires --
+    the survey must never abort because complexity could not be measured (INV-6).
+    """
+    try:
+        from core.structural_index import complexity_for_file
+    except Exception:
+        return 0
+
+    source_files = sorted(group.files, key=lambda item: item[1])
+    if not source_files or budget <= 0:
+        return 0
+    allowance = min(_COMPLEXITY_FILES_PER_GROUP, budget)
+    stride = max(1, len(source_files) // allowance)
+    sample = source_files[::stride][:allowance]
+
+    opened = 0
+    for abs_path, rel in sample:
+        try:
+            with open(abs_path, "rb") as handle:
+                blob = handle.read(_MAX_SCAN_BYTES)
+        except OSError:
+            continue
+        opened += 1
+        try:
+            measured = complexity_for_file(rel, blob)
+        except Exception:
+            continue
+        if measured is None:
+            continue
+        group.complexity_total += measured["complexity"]
+        group.complexity_files += 1
+        group.function_total += measured["functions"]
+    return opened
+
+
 def _churn_by_group(repo_dir: Path, jail_dir: Path) -> dict[str, float]:
     """Churn, revert density and CVE-referencing commits, via CP-2 only.
 
@@ -781,9 +852,32 @@ def _archetype_for(group: _Group) -> str:
 
 
 def _complexity_for(file_count: int) -> str:
+    """File-count buckets: the FALLBACK when complexity could not be measured.
+
+    Before the measured signal existed this was the only estimate, and it answers a
+    different question -- "how much ground is this" rather than "how tangled is it".
+    Kept because a survey with no working grammar still owes the planner a size
+    statement, and `complexity_basis` discloses which question was answered.
+    """
     if file_count < 50:
         return "low"
     if file_count < 500:
+        return "medium"
+    return "high"
+
+
+def _measured_complexity_for(mean_complexity: float) -> str:
+    """Buckets a group's measured mean G per function.
+
+    Thresholds anchor on SonarSource's long-standing per-function warning level of
+    15: a sampled MEAN of 12 across every function in an area -- trivial getters
+    included -- means the typical function is near the level a linter would flag
+    individually, which is exactly what "high" should claim. Below 4 the typical
+    function is one branch or none.
+    """
+    if mean_complexity < 4.0:
+        return "low"
+    if mean_complexity < 12.0:
         return "medium"
     return "high"
 
@@ -874,6 +968,14 @@ def survey(
         budget -= _scan_group_surface(group, budget, coverage)
         groups_scanned += 1
 
+    # Pass 3 shares the cheap-rank visit order, so the parse budget drains into the
+    # same plausible subsystems the content scan prioritized.
+    parse_budget = _MAX_PARSED_FILES
+    for group in ordered:
+        if parse_budget <= 0:
+            break
+        parse_budget -= _scan_group_complexity(group, parse_budget)
+
     churn = _churn_by_group(resolved, resolved) if include_churn else {}
 
     surface_raw = {g.key: (g.surface_score / g.scanned if g.scanned else 0.0) for g in candidates.values()}
@@ -888,18 +990,27 @@ def survey(
     # replaced was a restatement of directory size.
     boundary_raw = {g.key: _boundary_density(g) for g in candidates.values()}
     language_raw = {g.key: g.language_risk() for g in candidates.values()}
+    # Complexity as mean G per PARSED file, not per group member: a file that never
+    # parsed must not dilute the mean, and a group where nothing parsed scores 0.0
+    # with its complexity_sampled count disclosing why.
+    complexity_raw = {
+        g.key: (g.complexity_total / g.complexity_files if g.complexity_files else 0.0)
+        for g in candidates.values()
+    }
 
     normalized = {
         "attack_surface": _normalize(surface_raw),
         "churn": _normalize(churn_raw),
         "boundaries": _normalize(boundary_raw),
         "language_risk": _normalize(language_raw),
+        "cognitive_complexity": _normalize(complexity_raw),
     }
     base_weights = {
         "attack_surface": _W_SURFACE,
         "churn": _W_CHURN,
         "boundaries": _W_BOUNDARY,
         "language_risk": _W_LANGUAGE,
+        "cognitive_complexity": _W_COMPLEXITY,
     }
     weights, inactive_signals = _rebalance_weights(normalized, base_weights)
     if inactive_signals:
@@ -914,6 +1025,7 @@ def survey(
     churn_n = normalized["churn"]
     boundary_n = normalized["boundaries"]
     language_n = normalized["language_risk"]
+    complexity_n = normalized["cognitive_complexity"]
 
     saturation = math.log1p(_SIZE_SATURATION_FILES)
     scored: list[tuple[float, _Group]] = []
@@ -934,6 +1046,15 @@ def survey(
 
     slices = []
     for rank, (score, group) in enumerate(top, start=1):
+        # Mean G per function needs both a successful parse and at least one named
+        # function: a group of pure scripts has real complexity but no denominator,
+        # and pretending otherwise would report a per-function number no function
+        # produced. Such groups keep the file-count fallback, disclosed as such.
+        mean_complexity = (
+            round(group.complexity_total / group.function_total, 1)
+            if group.complexity_files and group.function_total
+            else None
+        )
         slices.append(
             {
                 "id": f"slice_{_slug(group.key)}",
@@ -945,14 +1066,26 @@ def survey(
                 "archetype_is_advisory": True,
                 "language": group.language,
                 "root_paths": [group.key if group.key != "." else "."],
-                "estimated_complexity": _complexity_for(len(group.files)),
+                "estimated_complexity": (
+                    _measured_complexity_for(mean_complexity)
+                    if mean_complexity is not None
+                    else _complexity_for(len(group.files))
+                ),
+                # Which estimator produced estimated_complexity: "measured" is mean
+                # cognitive complexity per function, "file_count" is the size-bucket
+                # fallback. Disclosed because the two answer different questions and
+                # a consumer sizing a campaign deserves to know which one it got.
+                "complexity_basis": "measured" if mean_complexity is not None else "file_count",
                 "signals": {
                     "attack_surface": round(surface_n.get(group.key, 0.0), 3),
                     "churn": round(churn_n.get(group.key, 0.0), 3),
                     "boundaries": round(boundary_n.get(group.key, 0.0), 3),
                     "language_risk": round(language_n.get(group.key, 0.0), 3),
+                    "cognitive_complexity": round(complexity_n.get(group.key, 0.0), 3),
+                    "mean_complexity": mean_complexity,
                     "source_files": len(group.files),
                     "content_sampled": group.scanned,
+                    "complexity_sampled": group.complexity_files,
                 },
             }
         )
@@ -968,6 +1101,7 @@ def survey(
             "groups_content_scanned": groups_scanned,
             "sampled_file_budget": _MAX_SAMPLED_FILES,
             "sampled_files_used": _MAX_SAMPLED_FILES - budget,
+            "complexity_files_sampled": _MAX_PARSED_FILES - parse_budget,
             "scan_coverage_complete": groups_scanned >= len(candidates),
             "churn_available": bool(churn),
             # Which signals failed to discriminate, and the weights actually applied
@@ -1187,6 +1321,16 @@ def render_slice_briefing(astm: dict[str, Any], scan_target: str) -> str:
         f"churn {signals.get('churn')}, trust boundaries {signals.get('boundaries')}, "
         f"language risk {signals.get('language_risk')} (0-1, relative to this repository).",
     ]
+
+    # Only when this survey measured it: surveys stored by older schema versions
+    # carry no mean_complexity, and the briefing must render them unchanged.
+    mean_complexity = signals.get("mean_complexity")
+    if isinstance(mean_complexity, (int, float)) and not isinstance(mean_complexity, bool):
+        lines.append(
+            f"  Cognitive complexity: measured {mean_complexity} per function "
+            f"across {signals.get('complexity_sampled')} parsed file(s), so the "
+            f"complexity rating above is measured nesting depth, not a size guess."
+        )
 
     siblings = [
         s for s in slices

@@ -394,7 +394,7 @@ SCENARIOS = {
     # ---- Status integrity: stamps, dismissals, case folds ----
     'status_revert_run_wide_stamp': [
         ('core/database.py',
-         '              AND (filepath = ? OR filepath LIKE ? ESCAPE \'\\\\\')\n              {terminal_clause}\n        """, (status, run_id, base, escaped + "/%"))',
+         '              AND {scope_clause}\n              {terminal_clause}\n        """, (status, run_id, *scope_params))',
          '              {terminal_clause}\n        """, (status, run_id))  # NEUTERED: one slice\'s stamp launders every other slice\'s findings'),
     ],
     'status_revert_addressless_stamp': [
@@ -1308,6 +1308,61 @@ SCENARIOS = {
          "        for member in []:"
          "  # NEUTERED: members are never stamped; coverage math lies"),
     ],
+
+    # ---- Structural index: hint-only navigation, jail, CP-4 ----
+    "structural_revert_ambiguity_guess": [
+        ("tools/structural_tools.py",
+         "    if len(rows) > 1:\n"
+         "        listing = \"\\n\".join(_symbol_line(r) for r in rows[:_PAGE_SIZE])",
+         "    if False:  # NEUTERED: silently analyzes the first same-name definition\n"
+         "        listing = \"\\n\".join(_symbol_line(r) for r in rows[:_PAGE_SIZE])"),
+    ],
+    "structural_revert_single_file_jail": [
+        ("tools/structural_tools.py",
+         "        if ctx.target_file and os.path.isfile(ctx.target_file) and ctx.jail_dir and resolved:",
+         "        if False:  # NEUTERED: single-file scans read any file through boundary lookups"),
+    ],
+    "structural_revert_unwrapped_source": [
+        ("tools/structural_tools.py",
+         '            header + "\\n"\n'
+         '            + wrap_untrusted_content(snippet, filename=res["file_path"])',
+         '            header + "\\n"\n'
+         "            + snippet  # NEUTERED: raw target source enters the prompt unfenced"),
+    ],
+    "structural_revert_llm_stage": [
+        ("core/graph_loader.py",
+         '            if node_id == "structural_index":',
+         "            if False:  # NEUTERED: the stage burns an LLM call writing an index nothing reads"),
+    ],
+    "structural_revert_gap_is_complete": [
+        ("core/structural_index.py",
+         "    elif truncated or indexed < len(coverage_rows):",
+         '    elif truncated:  # NEUTERED: coverage gaps still claim status "complete"'),
+    ],
+    # --- INV-3: lineage symbols grounded in the catalog, not in prose ---
+    "lineage_revert_symbol_grounding": [
+        ("core/database.py",
+         "            grounded_symbol = ground_symbol_in_catalog(db_path, finding_filepath, line_numbers)\n"
+         "            if grounded_symbol:\n"
+         "                target_symbol = grounded_symbol",
+         "            pass  # NEUTERED: lineage symbol rides on prose extraction only"),
+    ],
+    "prefix_reuse_mode_gate_removed": [
+        ("core/graph_loader.py",
+         "            if getattr(ctx, \"scan_mode\", \"\") != _SCAN_MODE_CROSS_FUNCTIONAL:\n"
+         "                return None\n"
+         "            if ctx.run_id not in completed_runs:",
+         "            if ctx.run_id not in completed_runs:  # NEUTERED: any mode may reuse"),
+        ("core/graph_loader.py",
+         "            if (\n"
+         "                ctx\n"
+         "                and ctx.run_id\n"
+         "                and getattr(ctx, \"scan_mode\", \"\") == _SCAN_MODE_CROSS_FUNCTIONAL\n"
+         "            ):\n"
+         "                completed_runs.add(ctx.run_id)",
+         "            if ctx and ctx.run_id:  # NEUTERED: any mode marks completion\n"
+         "                completed_runs.add(ctx.run_id)"),
+    ],
 }
 
 
@@ -1353,6 +1408,9 @@ def run_matrix(only_scenarios=None):
                 "tests.test_verdicts_recall_sentinel",
                 "tests.test_chains_groups",
                 "tests.test_campaign_scoping",
+                "tests.test_structural_index",
+                "tests.test_symbol_grounding",
+                "tests.test_prefix_reuse",
                 "-v",
             ],
             cwd=dst, capture_output=True, text=True, env=matrix_env,

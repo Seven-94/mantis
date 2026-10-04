@@ -136,6 +136,11 @@ A valid workflow JSON has the following top-level structure:
   * "run_sandbox": Run bash commands inside isolated container/VM sandbox.
   * "apply_patch": Apply unified diff patch inside sandbox.
   * "run_sandbox_with_evidence": Execute exploit PoC and verify reached-sink sentinel or crash trace.
+- Structural Navigation Tools (deterministic, backed by the tree-sitter catalog; degrade to a baseline-tools pointer when the index is absent):
+  * "find_symbol": Locate symbol definitions by name across the target.
+  * "find_callers": List call sites of a function across files.
+  * "find_callees": List functions a given function calls.
+  * "get_function_boundary": Read a single enclosing function instead of a whole file.
 
 ### KNOWN STANDARD SKILLS:
 "mantis-threat-model", "mantis-researcher", "mantis-dedupe", "mantis-review", "mantis-critic",

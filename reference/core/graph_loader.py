@@ -451,6 +451,97 @@ def campaign_has_findings_to_triage(db_path: str, run_id: str, target_file: str)
     return any(str(r.get("status") or "").lower() not in inactive for r in rows)
 
 
+# Repo-scope prefix stages that may reuse their own completed artifacts across
+# campaigns of one run, mapped to the artifact type that proves completion.
+_PREFIX_REUSE_ARTIFACTS = {
+    "architect": "summary",
+    "threat_modeler": "threat_model",
+}
+
+# main.py owns the scan-mode vocabulary; the literal is mirrored here because
+# importing main from this module would be circular. A test pins the two equal.
+_SCAN_MODE_CROSS_FUNCTIONAL = "cross-functional"
+
+
+def _make_prefix_reuse_callbacks(node_id: str):
+    """Before/after callbacks that let a repo-scope prefix stage reuse itself.
+
+    In cross-functional mode every campaign shares the repository jail, and the
+    architect / threat modeler re-derive the same repo-wide summary and threat
+    model on every campaign, overwriting the previous campaign's row each time
+    (campaign_artifacts is UNIQUE(run_id, filepath)). The before-callback
+    returns reuse text -- which the runtime treats as the agent's output,
+    skipping the LLM call -- only when ALL of:
+
+      * the run is cross-functional. Per-campaign jails make reuse wrong, so
+        file-by-file and unknown modes always re-run;
+      * this process already ran the stage to completion for this run_id.
+        Process-local on purpose: a resumed run re-derives against the
+        resynced checkout instead of trusting a pre-restart artifact;
+      * the stage's artifact row actually exists in the database.
+
+    Everything else -- missing context, missing artifact, any exception --
+    falls through to running the stage, which is the behavior that shipped
+    (INV-6). What reuse costs is the per-campaign briefing nuance these stages
+    would otherwise see in the seed message; what it buys is their LLM spend
+    on every campaign after the first.
+    """
+    completed_runs: set[str] = set()
+
+    def _before(callback_context=None):
+        try:
+            from core.context import current_run_context
+
+            ctx = current_run_context.get()
+            if ctx is None or not ctx.run_id or not ctx.db_path:
+                return None
+            if getattr(ctx, "scan_mode", "") != _SCAN_MODE_CROSS_FUNCTIONAL:
+                return None
+            if ctx.run_id not in completed_runs:
+                return None
+            from core.database import read_artifact
+            from core.paths import resolve_db_path
+
+            artifact = read_artifact(
+                resolve_db_path(ctx.db_path),
+                artifact_type=_PREFIX_REUSE_ARTIFACTS[node_id],
+                run_id=ctx.run_id,
+            )
+            if not artifact:
+                return None
+            return types.Content(
+                role="model",
+                parts=[types.Part(text=(
+                    f"[{node_id}] Reused the {_PREFIX_REUSE_ARTIFACTS[node_id]} "
+                    f"artifact recorded by an earlier campaign of this run: "
+                    f"cross-functional campaigns share the repository jail, so "
+                    f"this stage's repo-wide input is unchanged. No new "
+                    f"analysis was performed."
+                ))],
+            )
+        except Exception:
+            return None
+
+    def _after(callback_context=None):
+        # The runtime fires this only when the stage completed without
+        # raising; the artifact row is still verified at reuse time.
+        try:
+            from core.context import current_run_context
+
+            ctx = current_run_context.get()
+            if (
+                ctx
+                and ctx.run_id
+                and getattr(ctx, "scan_mode", "") == _SCAN_MODE_CROSS_FUNCTIONAL
+            ):
+                completed_runs.add(ctx.run_id)
+        except Exception:
+            pass
+        return None
+
+    return _before, _after
+
+
 def create_findings_gate(node_id: str):
     """Deterministic zero-findings short-circuit after the researcher.
 
@@ -475,6 +566,52 @@ def create_findings_gate(node_id: str):
         return adk.Event(output=node_input, route=DEFAULT_ROUTE)
 
     return node(_gate, name=node_id)
+
+
+def create_structural_index_node(node_id: str):
+    """Deterministic tree-sitter structural index build.
+
+    This stage used to be an LLM agent hand-writing a JSONL index that no
+    downstream tool ever queried. It now builds the real catalog the
+    structural navigation tools (find_symbol, find_callers, find_callees,
+    get_function_boundary) read. Fail-safe: any failure publishes nothing
+    and the campaign proceeds exactly as it would without an index.
+    """
+    async def _build(ctx: Context, node_input: Any = None):
+        from core.context import current_run_context
+
+        rc = current_run_context.get()
+        try:
+            from core.paths import resolve_db_path
+            from core.structural_index import build_structural_index, state_dir_for_db
+
+            jail = getattr(rc, "jail_dir", None) or ""
+            db_path = (getattr(rc, "db_path", None) or ctx.state.get("db_path") or "")
+            if not jail or not db_path:
+                msg = "Structural index skipped: no target checkout in context."
+                print(f"[{node_id}] {msg}", flush=True)
+                return adk.Event(output=msg, route=DEFAULT_ROUTE)
+            state_dir = state_dir_for_db(resolve_db_path(db_path))
+            snapshot_id = getattr(rc, "snapshot_id", "") or "unknown"
+            res = build_structural_index(jail, state_dir, snapshot_id)
+            cov = res.get("coverage") or {}
+            units = res.get("units") or {}
+            summary = (
+                f"Structural index {res.get('status', 'failed')}: "
+                f"{cov.get('indexed_files', 0)}/{cov.get('total_files', 0)} files indexed, "
+                f"{units.get('total', 0)} units ({units.get('reused', 0)} reused)."
+            )
+            print(f"[{node_id}] {summary}", flush=True)
+            return adk.Event(output=summary, route=DEFAULT_ROUTE)
+        except Exception as e:
+            msg = (
+                f"Structural index unavailable ({type(e).__name__}); "
+                "downstream stages fall back to read_file."
+            )
+            print(f"[{node_id}] {msg}", flush=True)
+            return adk.Event(output=msg, route=DEFAULT_ROUTE)
+
+    return node(_build, name=node_id)
 
 
 def _parse_finding_calibration(
@@ -1018,6 +1155,13 @@ def load_workflow_from_json(
             continue
 
         if isinstance(node_cfg, AgentNode):
+            if node_id == "structural_index":
+                # Deterministic replacement, intercepted by id so the
+                # workflow.json node and topology stay untouched. No model
+                # or tools are built: the stage makes no LLM calls.
+                nodes[node_id] = create_structural_index_node(node_id)
+                node_specs[node_id] = {"type": "agent"}
+                continue
             node_has_error = False
             # The exact call graph build used to make eagerly, frozen as a
             # zero-argument resolver so it can run either here (normal path)
@@ -1194,6 +1338,15 @@ def load_workflow_from_json(
                 agent_kwargs["after_agent_callback"] = _make_completion_stamp_callback(
                     node_id, node_cfg.on_enter_status
                 )
+
+            if node_id in _PREFIX_REUSE_ARTIFACTS and not node_cfg.on_enter_status:
+                # Repo-scope prefix reuse (cross-functional runs only; see
+                # _make_prefix_reuse_callbacks). Attached only when the node
+                # carries no completion stamp, so a future on_enter_status on
+                # these nodes disables reuse rather than displacing the stamp.
+                before_reuse, after_reuse = _make_prefix_reuse_callbacks(node_id)
+                agent_kwargs["before_agent_callback"] = before_reuse
+                agent_kwargs["after_agent_callback"] = after_reuse
 
             agent = adk.Agent(**agent_kwargs)
             node_retry = (

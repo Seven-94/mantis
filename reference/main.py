@@ -1227,6 +1227,9 @@ async def pipeline(
                     token_budget=resolved_budget.max_tokens,
                     scan_mode=scan_mode,
                     budget_controller=budget_ctrl,
+                    # This run's survey, so candidate lines carry rank and
+                    # measured complexity. None when Phase 0 was skipped.
+                    astm=astm,
                     **planner_steering,
                 )
             if campaign_plan.get("available") and campaign_plan.get("targets"):
@@ -1556,6 +1559,7 @@ async def pipeline(
         run_id=run_id,
         snapshot_id=snapshot_id,
         budget_controller=budget_ctrl,
+        scan_mode=scan_mode,
     )
 
     print(f"\n🚀 Engaging JSON Graph over target: {target_path} (Run ID: {run_id})...")

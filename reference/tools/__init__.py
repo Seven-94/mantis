@@ -28,6 +28,12 @@ from .sandbox_tools import (
     run_sandbox_with_evidence,
     check_reached_sink_evidence,
 )
+from .structural_tools import (
+    find_symbol,
+    find_callers,
+    find_callees,
+    get_function_boundary,
+)
 
 TOOLS: dict[str, object] = {
     "read_file": read_file,
@@ -54,4 +60,8 @@ TOOLS: dict[str, object] = {
     "run_sandbox_with_evidence": run_sandbox_with_evidence,
     "get_security_guidance": get_security_guidance,
     "query_lineage": query_lineage,
+    "find_symbol": find_symbol,
+    "find_callers": find_callers,
+    "find_callees": find_callees,
+    "get_function_boundary": get_function_boundary,
 }

@@ -8,8 +8,16 @@ import database
 import fetcher
 import helpers
 import storage
+from web.account_routes import account_bp
+from web.hooks_routes import hooks_bp
+from web.orders_routes import orders_bp
+from web.reports_routes import reports_bp
 
 app = Flask(__name__)
+app.register_blueprint(orders_bp)
+app.register_blueprint(reports_bp)
+app.register_blueprint(account_bp)
+app.register_blueprint(hooks_bp)
 
 
 @app.route("/api/user")

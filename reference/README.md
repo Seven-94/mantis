@@ -263,7 +263,7 @@ Three rules are enforced structurally, not by convention:
 
 ## Custom Tools
 
-The 24 built-in tools are a closed set, and a workflow naming anything else
+The 28 built-in tools are a closed set, and a workflow naming anything else
 fails validation. Without a way in, a site with an internal taint engine or a
 house SAST tool has exactly one option: fork. A fork never receives the next
 security fix, so leaving the set closed does not prevent custom tools — it makes
@@ -271,7 +271,7 @@ the unsafe way the only way.
 
 ### Why a declared tool inherits no trust
 
-The built-in 24 are not safe because they are confined. Most run on the host
+The built-in 28 are not safe because they are confined. Most run on the host
 with the host's full privilege: nothing in the process stops `read_file` from
 opening `~/.ssh/id_rsa`. They are safe because they **are** the enforcement —
 `read_file` is the containment for reads, `run_sandbox` for execution,
@@ -499,8 +499,9 @@ complete vulnerability campaign lifecycle:
 
 01. **`history`**: Extracts commit history, churn hotspots, and developer
     activity logs.
-02. **`structural_index`**: Generates code AST, symbol graphs, and function
-    boundaries.
+02. **`structural_index`**: Deterministically builds the tree-sitter symbol,
+    call-edge, and function-boundary catalog that backs the structural
+    navigation tools (no LLM calls).
 03. **`architect`**: Constructs the structured Markdown Knowledge Base
     (`workspace/kb/`).
 04. **`threat_modeler`**: Maps threat actors, entry points, and trust boundaries

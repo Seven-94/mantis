@@ -513,6 +513,25 @@ code-reading analysis stage. See
 [mantis-structural-index/SKILL.md](mantis-structural-index/SKILL.md) for the
 full specification.
 
+The reference harness exposes the same capability as four researcher tools
+(`find_symbol`, `find_callers`, `find_callees`, `get_function_boundary`),
+attached to the researcher node by default in `reference/workflow.json`, with
+the researcher prompt directing the model to prefer function-level retrieval
+over whole-file reads. In a six-run-per-arm A/B against a ~58k-line Linux kernel
+driver, the indexed arm reported findings at 75% precision versus 22% for the
+read-everything baseline, at roughly half the tokens, and surfaced a real
+caller-hop overflow that every baseline run missed even though four of them had
+read the containing file in full. Coverage is complementary rather than strictly
+better — the baseline's exhaustive reads caught one bug the indexed runs did not
+— and on small targets that fit comfortably in context the index adds cost
+without measured recall gain, so cost-sensitive deployments auditing small
+codebases can remove the four tool names from the researcher node to fall back
+to the cheaper read-only toolset. When the index is missing or stale the tools
+degrade to a note pointing back at the baseline tools, so the default is safe
+even for targets the index builder cannot parse. See
+[reference/evals/README.md](reference/evals/README.md) for the measurement
+record.
+
 > **Note on Standalone vs. Harness Mode:** When using Mantis Skills directly
 > from the CLI in standalone mode, skills like `/mantis-review` or
 > `/mantis-patch` will instruct the LLM to write temporary reusable Python

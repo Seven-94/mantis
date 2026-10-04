@@ -62,9 +62,8 @@ RESEARCH_PROMPT = (
     "Report only real flaws; do not pad with style issues or hypotheticals."
 )
 
-# The A/B variable. 'structural' lists future tool names in advance: names
-# not registered in tools.TOOLS are skipped with a warning, so the A/B runs
-# today and picks the new tools up automatically once they land.
+# The A/B variable. Names not registered in tools.TOOLS are skipped with a
+# warning, so either arm degrades to a smaller toolset rather than failing.
 TOOLSETS: Dict[str, List[str]] = {
     "baseline": [
         "read_file",
@@ -85,7 +84,7 @@ TOOLSETS: Dict[str, List[str]] = {
         "get_plan",
         "report_findings",
         "get_findings",
-        # Future structural tools; skipped until registered:
+        # Structural navigation over the deterministic tree-sitter catalog:
         "get_function_boundary",
         "find_symbol",
         "find_callers",
@@ -229,6 +228,96 @@ def extract_event_tokens(event: Any) -> int:
         return 0
 
 
+# --- Abort guard ----------------------------------------------------------------------
+
+# A text-only reply with no tool call ends an ADK run. On the first turn of
+# a campaign that reads as a silent abort: zero findings, nothing attempted,
+# full prompt cost paid. The guard re-arms such a run exactly once with a
+# deterministic nudge; a run that aborts twice is a result, not an accident
+# to paper over.
+
+ABORT_GUARD_MIN_TOOL_CALLS = 8
+
+ABORT_GUARD_PROMPT = (
+    "Your previous reply ended the run without doing the audit: no findings "
+    "were reported and no tools were called. Do not answer with prose only. "
+    "Resume now: call list_files('app'), read the source, and report every "
+    "confirmed vulnerability via report_findings before you finish."
+)
+
+
+def count_event_tool_calls(event: Any) -> int:
+    """Function calls carried by one ADK event. Never raises."""
+    try:
+        parts = getattr(getattr(event, "content", None), "parts", None) or []
+        return sum(1 for part in parts if getattr(part, "function_call", None))
+    except Exception:
+        return 0
+
+
+def should_rearm_run(findings_count: int, tool_calls: int, rearms_used: int) -> bool:
+    """True only for the first run that ends with nothing reported and
+    nearly nothing attempted. A run that reported anything, or genuinely
+    worked and came up empty, is scored as it stands."""
+    return (
+        rearms_used == 0
+        and findings_count == 0
+        and tool_calls < ABORT_GUARD_MIN_TOOL_CALLS
+    )
+
+
+# --- Transcript capture ---------------------------------------------------------------
+
+# The transcript is what a human reads to follow a run hop by hop: which
+# tools the model called, with what arguments, and what came back. Clipping
+# keeps file dumps from drowning the trace; the clip marker says how much
+# was cut so nothing disappears silently.
+
+TRANSCRIPT_TEXT_LIMIT = 8_000
+TRANSCRIPT_PAYLOAD_LIMIT = 4_000
+
+
+def _clip(value: Any, limit: int) -> str:
+    text = str(value)
+    if len(text) > limit:
+        return text[:limit] + f"... [clipped {len(text) - limit} chars]"
+    return text
+
+
+def event_transcript_rows(event: Any) -> List[Dict[str, Any]]:
+    """Flattens one ADK event into ordered transcript rows. Never raises."""
+    rows: List[Dict[str, Any]] = []
+    try:
+        author = str(getattr(event, "author", None) or "")
+        parts = getattr(getattr(event, "content", None), "parts", None) or []
+        for part in parts:
+            text = getattr(part, "text", None)
+            call = getattr(part, "function_call", None)
+            resp = getattr(part, "function_response", None)
+            if text:
+                rows.append(
+                    {"author": author, "type": "text",
+                     "text": _clip(text, TRANSCRIPT_TEXT_LIMIT)}
+                )
+            if call is not None:
+                rows.append(
+                    {"author": author, "type": "tool_call",
+                     "name": str(getattr(call, "name", "")),
+                     "args": _clip(getattr(call, "args", None),
+                                   TRANSCRIPT_PAYLOAD_LIMIT)}
+                )
+            if resp is not None:
+                rows.append(
+                    {"author": author, "type": "tool_response",
+                     "name": str(getattr(resp, "name", "")),
+                     "response": _clip(getattr(resp, "response", None),
+                                       TRANSCRIPT_PAYLOAD_LIMIT)}
+                )
+    except Exception:  # pragma: no cover - transcripts must never sink a run
+        return rows
+    return rows
+
+
 # --- Jail setup -----------------------------------------------------------------------
 
 
@@ -275,6 +364,8 @@ async def eval_researcher(
     effort: str,
     target_dir: Optional[Path] = None,
     toolset: str = "baseline",
+    transcript_path: Optional[Path] = None,
+    prompt_override: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Runs one researcher campaign over the seeded target and scores it."""
     from google.adk.runners import Runner
@@ -303,6 +394,12 @@ async def eval_researcher(
         ctx, reset_token = install_eval_run_context(
             str(jail_root), db_path, target_file=str(app_dir)
         )
+        if any(t in tool_names for t in
+               ("find_symbol", "find_callers", "find_callees", "get_function_boundary")):
+            # The structural arm needs its catalog. build never raises; a
+            # failed build just degrades the arm to baseline behavior.
+            from core.structural_index import build_structural_index, state_dir_for_db
+            build_structural_index(str(jail_root), state_dir_for_db(db_path))
         try:
             agent = build_stage_agent(
                 "researcher",
@@ -318,14 +415,37 @@ async def eval_researcher(
                 app_name="eval_app", user_id="eval_user"
             )
             content = types.Content(
-                role="user", parts=[types.Part.from_text(text=RESEARCH_PROMPT)]
+                role="user",
+                parts=[types.Part.from_text(text=prompt_override or RESEARCH_PROMPT)],
             )
             started = time.time()
-            try:
+            tool_calls = 0
+            rearms = 0
+            transcript: List[Dict[str, Any]] = []
+
+            async def _drain(message: types.Content) -> None:
+                nonlocal tokens, tool_calls
                 async for event in runner.run_async(
-                    session_id=session.id, user_id="eval_user", new_message=content
+                    session_id=session.id, user_id="eval_user", new_message=message
                 ):
                     tokens += extract_event_tokens(event)
+                    tool_calls += count_event_tool_calls(event)
+                    if transcript_path is not None:
+                        transcript.extend(event_transcript_rows(event))
+
+            try:
+                await _drain(content)
+                if should_rearm_run(len(read_findings(db_path)), tool_calls, rearms):
+                    logger.warning(
+                        "Researcher run ended on a tool-less reply; re-arming once."
+                    )
+                    rearms += 1
+                    await _drain(
+                        types.Content(
+                            role="user",
+                            parts=[types.Part.from_text(text=ABORT_GUARD_PROMPT)],
+                        )
+                    )
             except Exception as exc:
                 from core.config import is_auth_error
 
@@ -342,6 +462,10 @@ async def eval_researcher(
 
         findings = read_findings(db_path)
         result = score_research_findings(findings, gt_entries)
+        # The full records ride along for human adjudication: the eval
+        # database is deleted with the temp dir, and transcript payloads
+        # are clipped, so this is the only complete copy that survives.
+        result["findings_full"] = findings
         result.update(
             {
                 "toolset": toolset,
@@ -349,6 +473,8 @@ async def eval_researcher(
                 "latency": latency,
                 "run_errors": run_errors,
                 "total_tokens": tokens,
+                "tool_calls": tool_calls,
+                "abort_guard_rearms": rearms,
                 "tokens_per_detected": (
                     round(tokens / result["detected"])
                     if tokens and result["detected"]
@@ -356,6 +482,16 @@ async def eval_researcher(
                 ),
             }
         )
+        if transcript_path is not None:
+            try:
+                transcript_path.parent.mkdir(parents=True, exist_ok=True)
+                transcript_path.write_text(
+                    "".join(json.dumps(row, sort_keys=True) + "\n" for row in transcript),
+                    encoding="utf-8",
+                )
+                result["transcript_path"] = str(transcript_path)
+            except OSError as exc:
+                run_errors.append(f"transcript write failed: {exc}")
         return result
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
@@ -368,11 +504,27 @@ async def _main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--toolset", default="baseline", choices=sorted(TOOLSETS))
     parser.add_argument("--target", type=Path, default=None)
     parser.add_argument("--json-out", type=Path, default=None)
+    parser.add_argument(
+        "--transcript-out", type=Path, default=None,
+        help="Write a JSONL trace of prose, tool calls, and tool responses.",
+    )
+    parser.add_argument(
+        "--prompt-file", type=Path, default=None,
+        help="Replace the built-in researcher briefing with this file's text.",
+    )
     args = parser.parse_args(argv)
 
     os.environ.setdefault("VERTEXAI_LOCATION", "global")
+    prompt_override = (
+        args.prompt_file.read_text(encoding="utf-8") if args.prompt_file else None
+    )
     result = await eval_researcher(
-        args.model, args.effort, target_dir=args.target, toolset=args.toolset
+        args.model,
+        args.effort,
+        target_dir=args.target,
+        toolset=args.toolset,
+        transcript_path=args.transcript_out,
+        prompt_override=prompt_override,
     )
     print(json.dumps(result, indent=2))
     if args.json_out:

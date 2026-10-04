@@ -1,7 +1,7 @@
 {
   "format_version": "1.0",
   "target": "research_target",
-  "notes": "Ground truth for the researcher-stage evaluation (evals/research_eval.py). Seven seeded findings across six files; five require connecting a source in app.py to a sink in another file (cross_file=true), which is the headline capability structural navigation tools are expected to improve. This file is EXCLUDED from the copy of the target placed in the eval jail, so the model never sees the answers. A finding matches an entry when its filepath matches any entry in 'files' AND its title+description mention any phrase in 'match_any' (case-insensitive substring).",
+  "notes": "Ground truth for the researcher-stage evaluation (evals/research_eval.py). Sixteen findings across a 26-file package tree; fourteen require connecting a source route to a sink in another module (cross_file=true), several through a three-hop web -> services -> dal/integrations chain, which is the capability structural navigation tools are expected to improve. This file is EXCLUDED from the copy of the target placed in the eval jail, so the model never sees the answers. A finding matches an entry when its filepath matches any entry in 'files' AND its title+description+cwe mention any phrase in 'match_any' (case-insensitive substring).",
   "findings": [
     {
       "id": "sqli-find-user",
@@ -72,6 +72,96 @@
       "class": "timing_attack",
       "cross_file": true,
       "match_any": ["timing", "constant-time", "constant time", "cwe-208", "non-constant"]
+    },
+    {
+      "id": "sqli-order-column",
+      "files": ["dal/repo.py", "services/orders.py", "web/orders_routes.py"],
+      "sink": "dal/repo.py:list_orders_sorted",
+      "source": "web/orders_routes.py:/orders/grid",
+      "cwe": "CWE-89",
+      "class": "sql_injection",
+      "cross_file": true,
+      "match_any": ["sql injection", "sqli", "cwe-89", "order by", "column name interpolation"]
+    },
+    {
+      "id": "pickle-batch-cache",
+      "files": ["dal/cache.py", "services/imports.py", "web/orders_routes.py"],
+      "sink": "dal/cache.py:load_blob",
+      "source": "web/orders_routes.py:/orders/import",
+      "cwe": "CWE-502",
+      "class": "unsafe_deserialization",
+      "cross_file": true,
+      "match_any": ["pickle", "deserial", "cwe-502", "untrusted serialized"]
+    },
+    {
+      "id": "tar-bundle-extract",
+      "files": ["integrations/archives.py", "services/imports.py", "web/orders_routes.py"],
+      "sink": "integrations/archives.py:extract_bundle",
+      "source": "web/orders_routes.py:/orders/import/bundle",
+      "cwe": "CWE-22",
+      "class": "path_traversal",
+      "cross_file": true,
+      "match_any": ["path traversal", "cwe-22", "extractall", "tarfile", "archive extraction", "zip slip", "tar slip"]
+    },
+    {
+      "id": "format-settings-exposure",
+      "files": ["services/reports.py", "web/reports_routes.py"],
+      "sink": "services/reports.py:render_summary",
+      "source": "web/reports_routes.py:/reports/render",
+      "cwe": "CWE-74",
+      "class": "format_string_disclosure",
+      "cross_file": true,
+      "match_any": ["format string", "str.format", "cwe-74", "cwe-200", "information disclosure", "secrets disclosure", "settings exposure"]
+    },
+    {
+      "id": "open-redirect-login",
+      "files": ["utils/urls.py", "web/account_routes.py"],
+      "sink": "utils/urls.py:is_relative_url",
+      "source": "web/account_routes.py:/login/done",
+      "cwe": "CWE-601",
+      "class": "open_redirect",
+      "cross_file": true,
+      "match_any": ["open redirect", "cwe-601", "unvalidated redirect", "protocol-relative", "scheme-relative"]
+    },
+    {
+      "id": "weak-reset-token",
+      "files": ["utils/tokens.py", "services/accounts.py", "web/account_routes.py"],
+      "sink": "utils/tokens.py:make_reset_token",
+      "source": "web/account_routes.py:/account/reset",
+      "cwe": "CWE-330",
+      "class": "weak_randomness",
+      "cross_file": true,
+      "match_any": ["predictable", "cwe-330", "insecure random", "prng", "weak token", "time-seeded", "random.random"]
+    },
+    {
+      "id": "mail-header-crlf",
+      "files": ["integrations/mailer.py", "services/notify.py"],
+      "sink": "integrations/mailer.py:build_message",
+      "source": "services/notify.py:send_status_mail",
+      "cwe": "CWE-93",
+      "class": "header_crlf",
+      "cross_file": true,
+      "match_any": ["header injection", "crlf", "cwe-93", "newline", "smtp header"]
+    },
+    {
+      "id": "mass-assign-role",
+      "files": ["services/accounts.py", "web/account_routes.py"],
+      "sink": "services/accounts.py:update_profile",
+      "source": "web/account_routes.py:/account/update",
+      "cwe": "CWE-915",
+      "class": "mass_assignment",
+      "cross_file": true,
+      "match_any": ["mass assignment", "cwe-915", "privilege escalation", "role field", "overpermissive allowlist"]
+    },
+    {
+      "id": "webhook-ssrf",
+      "files": ["integrations/webhooks.py", "web/hooks_routes.py"],
+      "sink": "integrations/webhooks.py:deliver",
+      "source": "web/hooks_routes.py:/hooks/register",
+      "cwe": "CWE-918",
+      "class": "ssrf",
+      "cross_file": true,
+      "match_any": ["ssrf", "server-side request forgery", "cwe-918", "internal network", "callback url"]
     }
   ]
 }

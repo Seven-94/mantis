@@ -1312,6 +1312,52 @@ def _gate_proposals(
         return empty
 
 
+def _survey_annotation(astm: Any, target: Any) -> str:
+    """Survey measurements for one candidate line, or "". Never raises.
+
+    This is what makes the survey's complexity measurement non-cosmetic: the
+    planning model sizing a campaign gets told how the survey ranked the area and
+    how tangled its code measured, instead of inferring both from a bare path.
+
+    Emits NUMBERS and fixed vocabulary only -- the priority integer, the
+    low/medium/high bucket (checked against the closed set), and the measured
+    mean -- never repository bytes, which is why it may travel unfenced beside
+    the already-unfenced CP-3-validated candidate paths. The repository can
+    influence these values' magnitudes (that is the survey working as designed);
+    it cannot author a byte of what the model reads. Any failure, including an
+    astm of the wrong shape entirely, returns "" and the candidate line stays
+    bare (INV-6).
+    """
+    try:
+        if not isinstance(astm, dict):
+            return ""
+        from core.surveyor import _slice_for_target
+
+        entry = _slice_for_target(astm, str(target))
+        if not isinstance(entry, dict):
+            return ""
+        parts: List[str] = []
+        rank = entry.get("priority")
+        if isinstance(rank, int) and not isinstance(rank, bool):
+            parts.append(f"survey rank {rank}")
+        bucket = entry.get("estimated_complexity")
+        if bucket in ("low", "medium", "high"):
+            mean = (entry.get("signals") or {}).get("mean_complexity")
+            if entry.get("complexity_basis") == "measured" and isinstance(
+                mean, (int, float)
+            ) and not isinstance(mean, bool):
+                parts.append(
+                    f"measured complexity {bucket} (~{float(mean):g} per function)"
+                )
+            else:
+                parts.append(f"estimated complexity {bucket}")
+        if not parts:
+            return ""
+        return " (" + ", ".join(parts) + ")"
+    except Exception:
+        return ""
+
+
 async def propose_campaigns(
     db_path: str,
     target: str,
@@ -1322,6 +1368,7 @@ async def propose_campaigns(
     budget_controller: Any = None,
     focus: str = "",
     seed_report: str = "",
+    astm: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """The H-3 planning pass: asks an LLM what to examine next, gated structurally.
 
@@ -1338,6 +1385,12 @@ async def propose_campaigns(
     legitimate ask -- so the no-history early-returns yield when steering is present.
     Both default "" for exactly-current behavior; the gate downstream is identical
     with or without steering, because a prompt is a request and a gate is a guarantee.
+
+    `astm` is this run's survey, when the caller has one: each candidate line is
+    annotated with the survey's rank and measured complexity via
+    `_survey_annotation` (numbers and fixed vocabulary only -- see its trust
+    argument). Default None renders the bare candidate list unchanged, and a
+    malformed astm costs the annotation, never the plan.
 
     Returns the gated-plan dict from `_gate_proposals`, or `{"available": False, ...}`
     on ANY failure -- no context, no model, refusal, unparseable output, nothing
@@ -1407,7 +1460,8 @@ async def propose_campaigns(
                 afford_line = ""
 
         candidate_lines = "\n".join(
-            f"  - {t}" for t in (surveyor_targets or [])[:40]
+            f"  - {t}{_survey_annotation(astm, t)}"
+            for t in (surveyor_targets or [])[:40]
         )
         # Prompt assembly order states the trust story: operator instruction (focus)
         # travels unfenced beside the charter's own text; history and the seed
