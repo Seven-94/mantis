@@ -75,7 +75,7 @@
       "id": "reviewer",
       "type": "agent",
       "reasoning_effort": "medium",
-      "tools": ["read_file", "get_findings", "get_threat_model", "get_summary"],
+      "tools": ["read_file", "get_findings", "get_threat_model", "get_summary", "find_symbol", "find_callers", "find_callees", "get_function_boundary"],
       "output_schema": "ReviewVerdict",
       "output_key": "verdict"
     },
@@ -88,7 +88,7 @@
       "id": "critic",
       "type": "agent",
       "reasoning_effort": "high",
-      "tools": ["read_file", "get_findings", "get_threat_model"],
+      "tools": ["read_file", "get_findings", "get_threat_model", "find_symbol", "find_callers", "find_callees", "get_function_boundary"],
       "output_schema": "CriticVerdict",
       "output_key": "verdict"
     },
@@ -121,7 +121,7 @@
       "id": "patcher",
       "type": "agent",
       "reasoning_effort": "high",
-      "tools": ["apply_patch", "run_sandbox", "run_sandbox_with_evidence", "read_file", "write_file", "get_findings", "get_security_guidance", "query_lineage"],
+      "tools": ["apply_patch", "run_sandbox", "run_sandbox_with_evidence", "read_file", "write_file", "get_findings", "get_security_guidance", "query_lineage", "find_symbol", "find_callers", "find_callees", "get_function_boundary"],
       "on_enter_status": "dynamic_confirmed"
     },
     {

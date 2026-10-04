@@ -79,6 +79,8 @@ _DEF_KINDS = {
     "interface_declaration": "interface",  # java, typescript
     "struct_item": "struct",               # rust
     "impl_item": "class",                  # rust impl blocks
+    "preproc_def": "macro",                # c, cpp `#define FOO ...`
+    "preproc_function_def": "macro",       # c, cpp `#define FOO(x) ...`
 }
 
 _CALL_TYPES = frozenset({
@@ -574,7 +576,7 @@ def _write_catalog(state: Path, units: List[Dict[str, Any]], coverage_rows, snap
                      sym["file_path"], sym["start_line"], sym["end_line"], sym["kind"],
                      sym["signature"], EXTRACTOR_NAME),
                 )
-                if sym["kind"] in ("function", "method"):
+                if sym["kind"] in ("function", "method", "macro"):
                     conn.execute(
                         "INSERT OR REPLACE INTO function_boundaries VALUES (?, ?, ?, ?, ?, ?)",
                         (sym["symbol_id"], sym["file_path"], sym["start_line"],

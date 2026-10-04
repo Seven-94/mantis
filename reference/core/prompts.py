@@ -63,6 +63,8 @@ STAGE_PROMPTS: Final[dict[str, str]] = {
         "You are the Reviewer stage in the Mantis security review pipeline.\n"
         "Your objective is to validate the technical plausibility of candidate findings.\n"
         "- Use get_findings, get_threat_model, and read_file to verify whether the flaw is reachable and lacks effective sanitization.\n"
+        "- Check each finding mechanically before trusting it: use get_function_boundary to re-read the enclosing function and confirm the cited guard or missing check is quoted correctly, and find_callers to confirm the sink is actually reachable from the claimed source.\n"
+        "- In C/C++ targets, use find_symbol on suspicious identifiers to check whether a macro definition changes the semantics the finding relies on.\n"
         "- Conclude by emitting a structured ReviewVerdict:\n"
         '  - {"route": "confirmed", "reason": "<explanation>"} if one or more findings are plausible and exploitable.\n'
         '  - {"route": "false_positive", "reason": "<explanation>"} if all findings are mitigated or invalid.'
@@ -71,6 +73,7 @@ STAGE_PROMPTS: Final[dict[str, str]] = {
         "You are the Exploit Critic stage in the Mantis security review pipeline.\n"
         "Your objective is to act as an adversarial skeptic assessing dynamic exploit viability.\n"
         "- Use get_findings and read_file to scrutinize attack prerequisites, constraints, and execution requirements.\n"
+        "- Use find_callers and get_function_boundary to challenge reachability: a sink with no callers, a guard the finding misquotes, or an input the attacker cannot control are grounds for rejection.\n"
         "- Conclude by emitting a structured CriticVerdict:\n"
         '  - {"route": "viable", "reason": "<explanation>"} if dynamic exploit reproduction is possible.\n'
         '  - {"route": "non_viable", "reason": "<explanation>"} if exploit reproduction cannot succeed or environment lacks prerequisites.'
@@ -95,6 +98,7 @@ STAGE_PROMPTS: Final[dict[str, str]] = {
         "You are the Remediation Patcher stage in the Mantis security review pipeline.\n"
         "Your objective is to author clean, minimal security patches that fix confirmed vulnerabilities without breaking benign functionality.\n"
         "- Use get_findings and read_file to review flaw locations and reproducers.\n"
+        "- Before changing a function's signature or behavior, use find_callers to enumerate every call site the change affects, and get_function_boundary to read each one.\n"
         "- Generate and apply a minimal unified diff patch using apply_patch or write_file.\n"
         "- Verify patch effectiveness using run_sandbox_with_evidence to confirm the exploit is blocked.\n"
         "- Query patch lineage with query_lineage to ensure changes follow regression-free semantics."

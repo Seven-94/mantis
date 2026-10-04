@@ -163,7 +163,11 @@ def find_callers(symbol: str, filepath: str = "", offset: int = 0) -> str:
         if not res["results"]:
             return (
                 f"No recorded callers of '{symbol}' "
-                f"({row['file_path']}:{row['start_line']}).\n" + _footer(idx)
+                f"({row['file_path']}:{row['start_line']}).\n"
+                "Note: 0 direct call sites in the index. If this is an internal "
+                "helper (not a route handler, exported API, or callback "
+                "registered by reference), verify how untrusted input reaches "
+                "it before reporting a finding against it.\n" + _footer(idx)
             )
         lines = []
         for e in res["results"]:

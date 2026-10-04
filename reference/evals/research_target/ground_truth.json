@@ -135,7 +135,7 @@
     },
     {
       "id": "mail-header-crlf",
-      "files": ["integrations/mailer.py", "services/notify.py"],
+      "files": ["integrations/mailer.py", "services/notify.py", "web/orders_routes.py"],
       "sink": "integrations/mailer.py:build_message",
       "source": "services/notify.py:send_status_mail",
       "cwe": "CWE-93",

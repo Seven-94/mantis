@@ -205,6 +205,15 @@ class BudgetController:
         # here would make those deltas go negative. The ceiling below is NOT
         # checked against this counter -- see campaign_graph_steps.
         self.graph_steps = initial_steps
+        # CUMULATIVE count of code-reading tool calls made by AUDIT_NODES.
+        # Never reset: like graph_steps above, the scan loop reads a
+        # campaign's figure as the delta either side of the campaign, so
+        # zeroing this in begin_campaign() would break that arithmetic. A
+        # resumed run reconstructs the controller fresh and the count
+        # restarts at zero, which is safe for the same reason the ledger
+        # deltas are: every consumer snapshots its own before-value at a
+        # campaign boundary.
+        self.audit_code_reads = 0
         self.start_time = start_time or time.time()
         # ---- Per-CAMPAIGN runaway-loop guards ------------------------------
         # These counters answer "is THIS campaign stuck in a loop?", not "how
@@ -288,6 +297,8 @@ class BudgetController:
     def record_tool_call(self, node_name: str = "", tool_name: str = "") -> None:
         """Records a tool call executed by an agent node and enforces the per-node tool ceiling."""
         clean_node = node_name.split("/")[-1].split("@")[0] if node_name else "unknown"
+        if clean_node in AUDIT_NODES and tool_name in CODE_READ_TOOLS:
+            self.audit_code_reads += 1
         visit_idx = self.node_visit_counts.get(clean_node, 1)
         key = f"{clean_node}@{visit_idx}"
         self.node_tool_counts[key] = self.node_tool_counts.get(key, 0) + 1
@@ -568,3 +579,38 @@ class CampaignBudgetScope(BudgetController):
     def format_pause_banner(self, *args, **kwargs) -> str:
         """The pause banner reports the RUN, so it renders from the parent."""
         return self._parent.format_pause_banner(*args, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Coverage-credit gate
+# ---------------------------------------------------------------------------
+
+# Tools whose invocation means the agent actually looked at target code. The
+# scan loop refuses to credit a campaign to the coverage ledger unless at
+# least one of these ran during it: a campaign that finished without a single
+# code read examined nothing, whatever its exit status says.
+CODE_READ_TOOLS = ("read_file", "get_function_boundary")
+
+# Nodes whose code reads count as examination. The bookend stages (history,
+# architect, threat_modeler, planner, reporter, ...) call read_file on
+# workspace artifacts and orientation slices in EVERY campaign, so counting
+# them would hand a researcher that aborted on a prose-only first turn a
+# passing read delta every time. The names match workflow.json; the stages
+# listed after researcher only run once findings exist, so they can never
+# create credit on their own. A custom workflow whose audit nodes are named
+# differently fails CLOSED: reads count zero, credit is withheld with a
+# visible warning, and the slice is rescanned -- never silently stamped.
+AUDIT_NODES = ("researcher", "reviewer", "critic", "reproducer", "patcher")
+
+
+def should_credit_coverage(task_failed: bool, code_read_calls: int) -> bool:
+    """Decides whether a finished campaign earns an examined-area credit.
+
+    Pure so the gate is testable without a controller. A campaign is credited
+    only when it ran to completion AND read code at least once: an agent that
+    ends its run on a prose-only first turn comes back task_failed=False with
+    zero reads, and crediting that would stamp an unread slice "examined" in
+    the coverage ledger -- telling every later run that ground is covered
+    when nobody looked.
+    """
+    return (not task_failed) and code_read_calls > 0

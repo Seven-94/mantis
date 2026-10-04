@@ -35,13 +35,13 @@ STAGE_CONFIGS = {
     },
     'reviewer': {
         'skill': 'mantis-review',
-        'tools': ['read_file', 'get_findings', 'get_threat_model', 'get_summary'],
-        'instruction': 'You are the reviewer stage in the Mantis review pipeline. Evaluate findings against the active codebase and 13 triage rejection constraints. Return a ReviewVerdict with route="confirmed" for true vulnerabilities or route="false_positive" for benign/mock/unreachable/hygiene code.'
+        'tools': ['read_file', 'get_findings', 'get_threat_model', 'get_summary', 'find_symbol', 'find_callers', 'find_callees', 'get_function_boundary'],
+        'instruction': 'You are the reviewer stage in the Mantis review pipeline. Evaluate findings against the active codebase and 13 triage rejection constraints. Check each finding mechanically before trusting it: use get_function_boundary to re-read the enclosing function and confirm the cited guard or missing check is quoted correctly, and find_callers to confirm the sink is actually reachable from the claimed source. Return a ReviewVerdict with route="confirmed" for true vulnerabilities or route="false_positive" for benign/mock/unreachable/hygiene code.'
     },
     'critic': {
         'skill': 'mantis-critic',
-        'tools': ['read_file', 'get_findings', 'get_threat_model'],
-        'instruction': 'You are the critic stage in the Mantis review pipeline. Assess technical exploit viability and untrusted attacker reachability. Return a CriticVerdict with route="viable" if reachable and exploitable, or route="non_viable" if blocked by framework invariants or missing attack vectors.'
+        'tools': ['read_file', 'get_findings', 'get_threat_model', 'find_symbol', 'find_callers', 'find_callees', 'get_function_boundary'],
+        'instruction': 'You are the critic stage in the Mantis review pipeline. Assess technical exploit viability and untrusted attacker reachability. Use find_callers and get_function_boundary to challenge reachability: a sink with no callers, a guard the finding misquotes, or an input the attacker cannot control are grounds for rejection. Return a CriticVerdict with route="viable" if reachable and exploitable, or route="non_viable" if blocked by framework invariants or missing attack vectors.'
     },
     'calibrator': {
         'skill': 'mantis-calibrate',

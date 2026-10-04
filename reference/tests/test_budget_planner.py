@@ -37,7 +37,13 @@ if _REF_ROOT not in sys.path:
     sys.path.insert(0, _REF_ROOT)
 
 import core.planner as planner
-from core.budget import BudgetConfig, BudgetController, BudgetExceededError
+from core.budget import (
+    AUDIT_NODES,
+    BudgetConfig,
+    BudgetController,
+    BudgetExceededError,
+    should_credit_coverage,
+)
 from core.llm_gateway import UNTRUSTED_DATA_END, UNTRUSTED_DATA_START
 
 # Every control character except tab/newline, including ESC (\x1b) and the 8-bit
@@ -126,6 +132,53 @@ class TestBeginCampaignResetsOnlyCampaignScope(unittest.TestCase):
         self.assertEqual(ctrl.llm_calls, before["llm_calls"])
         self.assertEqual(ctrl.graph_steps, before["graph_steps"])
         self.assertEqual(ctrl.start_time, before["start_time"])
+
+
+class TestCoverageCreditGate(unittest.TestCase):
+    """A campaign that never read code must not be stamped as examined."""
+
+    def test_bookend_reads_do_not_count_as_examination(self):
+        """Every bookend stage (architect, planner, reporter, ...) calls
+        read_file on workspace artifacts in every campaign. If those reads
+        moved the counter, a researcher that aborted on a prose-only first
+        turn would inherit a passing read delta from the bookends every
+        single time -- the exact defeat this gate exists to prevent."""
+        ctrl = BudgetController(config=_quiet_config(), run_id="r_bookends")
+        for node in ("history", "architect", "threat_modeler", "planner", "reporter"):
+            ctrl.record_tool_call(node, "read_file")
+        self.assertEqual(ctrl.audit_code_reads, 0)
+
+    def test_audit_reads_count_and_survive_begin_campaign(self):
+        """main.py snapshots audit_code_reads either side of a campaign and
+        credits examined_areas off the delta. If begin_campaign() ever reset
+        it, the delta would be computed against a vanished baseline -- the
+        same corruption the ledger tests above guard against for tokens."""
+        ctrl = BudgetController(config=_quiet_config(), run_id="r_reads")
+        ctrl.record_tool_call("researcher", "read_file")
+        ctrl.record_tool_call("researcher@2", "get_function_boundary")
+        ctrl.record_tool_call("reviewer", "read_file")
+        ctrl.record_tool_call("researcher", "list_files")  # not a code read
+
+        self.assertEqual(ctrl.audit_code_reads, 3)
+
+        ctrl.begin_campaign()
+
+        self.assertEqual(ctrl.audit_code_reads, 3)
+
+    def test_audit_nodes_cover_the_stages_that_examine_code(self):
+        self.assertIn("researcher", AUDIT_NODES)
+        self.assertNotIn("planner", AUDIT_NODES)
+        self.assertNotIn("reporter", AUDIT_NODES)
+
+    def test_zero_read_success_is_not_credited(self):
+        """An agent that quits on a prose-only first turn produces
+        task_failed=False with zero reads. Crediting it would mark an unread
+        slice audited-and-clean in the coverage ledger forever."""
+        self.assertFalse(should_credit_coverage(task_failed=False, code_read_calls=0))
+
+    def test_read_backed_success_is_credited_and_failure_never_is(self):
+        self.assertTrue(should_credit_coverage(task_failed=False, code_read_calls=1))
+        self.assertFalse(should_credit_coverage(task_failed=True, code_read_calls=5))
 
 
 class TestMultiCampaignStepCeiling(unittest.TestCase):

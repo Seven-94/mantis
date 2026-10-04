@@ -27,6 +27,7 @@ from evals.research_eval import (
     _clip,
     _copy_target,
     count_event_tool_calls,
+    event_has_pseudo_tool_call,
     event_transcript_rows,
     extract_event_tokens,
     load_research_ground_truth,
@@ -285,6 +286,32 @@ class AbortGuardTest(unittest.TestCase):
         self.assertEqual(count_event_tool_calls(event), 2)
         self.assertEqual(count_event_tool_calls(types.SimpleNamespace()), 0)
         self.assertEqual(count_event_tool_calls(None), 0)
+
+    def test_pseudo_call_rearms_even_past_the_tool_count_threshold(self):
+        """A run that wrote its tool call as text ended mid-audit by accident;
+        no tool-count threshold can tell that from a deliberate stop."""
+        self.assertTrue(should_rearm_run(0, ABORT_GUARD_MIN_TOOL_CALLS, 0, True))
+        # Reported findings or a spent re-arm still take precedence.
+        self.assertFalse(should_rearm_run(1, ABORT_GUARD_MIN_TOOL_CALLS, 0, True))
+        self.assertFalse(should_rearm_run(0, ABORT_GUARD_MIN_TOOL_CALLS, 1, True))
+
+    def test_pseudo_call_detector_matches_crash_shape_not_prose(self):
+        def _text_event(text):
+            return types.SimpleNamespace(
+                content=types.SimpleNamespace(
+                    parts=[types.SimpleNamespace(text=text, function_call=None)]
+                )
+            )
+
+        crash = _text_event('call:default_api:read_file{"filepath": "app/x.py"}')
+        self.assertTrue(event_has_pseudo_tool_call(crash))
+        prose = _text_event("Next I will call read_file on app/x.py.")
+        self.assertFalse(event_has_pseudo_tool_call(prose))
+        self.assertFalse(event_has_pseudo_tool_call(types.SimpleNamespace()))
+        self.assertFalse(event_has_pseudo_tool_call(None))
+
+    def test_nudge_names_the_function_calling_interface(self):
+        self.assertIn("function-calling", ABORT_GUARD_PROMPT)
 
 
 class TranscriptRowsTest(unittest.TestCase):

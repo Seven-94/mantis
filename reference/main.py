@@ -23,7 +23,13 @@ from google.adk.apps.app import App, ResumabilityConfig
 from google.adk.apps.compaction import EventsCompactionConfig
 from google.adk.agents.context_cache_config import ContextCacheConfig
 
-from core.budget import BudgetConfig, BudgetController, BudgetExceededError, CampaignBudgetScope
+from core.budget import (
+    BudgetConfig,
+    BudgetController,
+    BudgetExceededError,
+    CampaignBudgetScope,
+    should_credit_coverage,
+)
 from core.database import init_db, read_findings, read_risk_scores, update_status
 from core.sandbox import build_sandbox
 from core.graph_loader import load_workflow_from_json, DEFAULT_SEED_PROMPT
@@ -1720,6 +1726,7 @@ async def pipeline(
             tokens_before = budget_ctrl.accumulated_tokens
             steps_before = budget_ctrl.graph_steps
             llm_calls_before = budget_ctrl.llm_calls
+            reads_before = budget_ctrl.audit_code_reads
             try:
                 task_failed = await execute_sub_task(
                     runner,
@@ -1760,21 +1767,36 @@ async def pipeline(
                     # Bookkeeping must never cost a scan that is finding real bugs.
                     print(f"[SPEND LEDGER WARNING] {exc}", file=sys.stderr)
 
-                # Coverage stamps for the members this campaign spanned beyond
-                # its primary -- see _stamp_member_coverage for the pairing
-                # with cost.py's zero-token exclusion.
-                _stamp_member_coverage(db_path, run_id, group, scan_item, scan_mode)
-
                 if task_failed:
                     failures += 1
                 else:
                     successes += 1
-                    # Credited ONLY here. A campaign that crashed, was skipped, or was
-                    # cut short by the budget did not examine this area, and recording
-                    # it as examined would tell every later run that ground is covered
-                    # when nobody looked -- a silent permanent blind spot, strictly
-                    # worse than having no ledger at all.
-                    examined_areas.append(scan_item)
+                    # Credited ONLY here, and only when the campaign actually
+                    # read code. A campaign that crashed, was skipped, or was
+                    # cut short by the budget did not examine this area -- and
+                    # neither did one that "succeeded" without a single
+                    # read_file/get_function_boundary call, which is what an
+                    # agent that quits on a prose-only first turn produces.
+                    # Recording either as examined would tell every later run
+                    # that ground is covered when nobody looked -- a silent
+                    # permanent blind spot, strictly worse than no ledger.
+                    code_reads = budget_ctrl.audit_code_reads - reads_before
+                    if should_credit_coverage(task_failed, code_reads):
+                        examined_areas.append(scan_item)
+                        # Member stamps live behind the SAME gate as the
+                        # primary: a failed or zero-read campaign examined its
+                        # secondaries no more than its primary, and stamping
+                        # them would hide unopened files from the next run's
+                        # gap-filler -- see _stamp_member_coverage for the
+                        # pairing with cost.py's zero-token exclusion.
+                        _stamp_member_coverage(db_path, run_id, group, scan_item, scan_mode)
+                    else:
+                        print(
+                            f"[COVERAGE GUARD] '{scan_item}': campaign finished without "
+                            "reading any code; withholding examined-area credit so a "
+                            "later run re-covers it.",
+                            file=sys.stderr,
+                        )
 
                 # The dossier entry for this campaign: what ran, what it
                 # grouped, and what it found as per-status counts -- stated,

@@ -34,6 +34,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -241,6 +242,8 @@ ABORT_GUARD_MIN_TOOL_CALLS = 8
 ABORT_GUARD_PROMPT = (
     "Your previous reply ended the run without doing the audit: no findings "
     "were reported and no tools were called. Do not answer with prose only. "
+    "Tool calls must go through the function-calling interface -- writing "
+    "one out as text, like 'call:api:read_file{...}', does nothing. "
     "Resume now: call list_files('app'), read the source, and report every "
     "confirmed vulnerability via report_findings before you finish."
 )
@@ -255,14 +258,41 @@ def count_event_tool_calls(event: Any) -> int:
         return 0
 
 
-def should_rearm_run(findings_count: int, tool_calls: int, rearms_used: int) -> bool:
+# Observed crash shape behind some silent aborts: the model writes the tool
+# call out as TEXT -- "call:default_api:read_file{...}" -- instead of
+# emitting a function_call part. ADK sees a text-only turn and ends the run
+# while the model believed it was mid-audit. Indistinguishable from a
+# deliberate stop by tool count alone, so it is detected directly.
+PSEUDO_TOOL_CALL_RE = re.compile(r"\bcall:\w+:\w+\s*\{")
+
+
+def event_has_pseudo_tool_call(event: Any) -> bool:
+    """True when a text part spells out a tool call instead of making one. Never raises."""
+    try:
+        parts = getattr(getattr(event, "content", None), "parts", None) or []
+        return any(
+            PSEUDO_TOOL_CALL_RE.search(getattr(part, "text", None) or "")
+            for part in parts
+        )
+    except Exception:
+        return False
+
+
+def should_rearm_run(
+    findings_count: int,
+    tool_calls: int,
+    rearms_used: int,
+    pseudo_tool_call: bool = False,
+) -> bool:
     """True only for the first run that ends with nothing reported and
-    nearly nothing attempted. A run that reported anything, or genuinely
-    worked and came up empty, is scored as it stands."""
+    nearly nothing attempted -- or that ended on a tool call written as
+    text, which no tool-count threshold can tell from a deliberate stop.
+    A run that reported anything, or genuinely worked and came up empty,
+    is scored as it stands."""
     return (
         rearms_used == 0
         and findings_count == 0
-        and tool_calls < ABORT_GUARD_MIN_TOOL_CALLS
+        and (tool_calls < ABORT_GUARD_MIN_TOOL_CALLS or pseudo_tool_call)
     )
 
 
@@ -421,23 +451,28 @@ async def eval_researcher(
             started = time.time()
             tool_calls = 0
             rearms = 0
+            pseudo_calls = False
             transcript: List[Dict[str, Any]] = []
 
             async def _drain(message: types.Content) -> None:
-                nonlocal tokens, tool_calls
+                nonlocal tokens, tool_calls, pseudo_calls
                 async for event in runner.run_async(
                     session_id=session.id, user_id="eval_user", new_message=message
                 ):
                     tokens += extract_event_tokens(event)
                     tool_calls += count_event_tool_calls(event)
+                    pseudo_calls = pseudo_calls or event_has_pseudo_tool_call(event)
                     if transcript_path is not None:
                         transcript.extend(event_transcript_rows(event))
 
             try:
                 await _drain(content)
-                if should_rearm_run(len(read_findings(db_path)), tool_calls, rearms):
+                if should_rearm_run(
+                    len(read_findings(db_path)), tool_calls, rearms, pseudo_calls
+                ):
                     logger.warning(
-                        "Researcher run ended on a tool-less reply; re-arming once."
+                        "Researcher run ended on a tool-less or text-written "
+                        "tool call reply; re-arming once."
                     )
                     rearms += 1
                     await _drain(

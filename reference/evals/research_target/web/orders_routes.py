@@ -2,7 +2,7 @@
 
 from flask import Blueprint, jsonify, request
 
-from services import imports, orders
+from services import imports, notify, orders
 
 orders_bp = Blueprint("orders", __name__)
 
@@ -12,6 +12,15 @@ def orders_grid():
     sort = request.args.get("sort")
     direction = request.args.get("dir", "DESC")
     return jsonify(orders.search_orders(sort, direction))
+
+
+@orders_bp.route("/orders/<int:order_id>/notify", methods=["POST"])
+def notify_customer(order_id):
+    recipient = request.form.get("recipient", "")
+    subject = request.form.get("subject", f"Update for order {order_id}")
+    note = request.form.get("note", "")
+    notify.send_status_mail(recipient, subject, note)
+    return jsonify({"sent": True, "order": order_id})
 
 
 @orders_bp.route("/orders/<int:order_id>")

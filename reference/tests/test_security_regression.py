@@ -243,6 +243,79 @@ class TestHostFilesystemBoundary(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([self.outside_file], outside_files)
 
 
+class TestRangedReadAndLargeReadNote(unittest.IsolatedAsyncioTestCase):
+    """read_file line ranges and the large-read steering note.
+
+    The range header must stay OUTSIDE the untrusted wrapper -- it is harness
+    bookkeeping, not file content, and placing it inside would let a hostile
+    file forge one. The steering note must fire only on unbounded reads of
+    large files: it exists to steer agents toward ranged reads, so appearing
+    on a ranged read would nag the exact behavior it recommends.
+    """
+
+    async def asyncSetUp(self):
+        self.tmp_dir = tempfile.mkdtemp(prefix="mantis_test_ranged_read_")
+        self.jail = Path(self.tmp_dir)
+        lines = [f"line {i}\n" for i in range(1, 51)]
+        (self.jail / "mod.py").write_text("".join(lines), encoding="utf-8")
+        self.db_path = str(self.jail / "knowledge.db")
+        init_db(self.db_path)
+        self.sandbox = build_sandbox({"type": "static-only", "options": {}}, str(self.jail))
+        self.ctx = RunContext(
+            jail_dir=str(self.jail),
+            db_path=self.db_path,
+            target_file=str(self.jail),
+            sandbox=self.sandbox,
+            run_id="ranged_read_run",
+        )
+        self.token = current_run_context.set(self.ctx)
+
+    async def asyncTearDown(self):
+        current_run_context.reset(self.token)
+        import shutil
+        shutil.rmtree(self.tmp_dir, ignore_errors=True)
+
+    async def test_range_returns_only_requested_lines_with_header_outside_wrapper(self):
+        res = await rt.read_file("mod.py", start_line=10, end_line=12)
+        self.assertTrue(res.startswith("[mod.py: lines 10-12 of 50]\n"))
+        self.assertLess(res.index("[mod.py:"), res.index(UNTRUSTED_DATA_START))
+        self.assertIn("line 10\n", res)
+        self.assertIn("line 12\n", res)
+        self.assertNotIn("line 9\n", res)
+        self.assertNotIn("line 13\n", res)
+
+    async def test_open_ended_clamped_and_invalid_ranges(self):
+        tail = await rt.read_file("mod.py", start_line=49)
+        self.assertIn("[mod.py: lines 49-50 of 50]", tail)
+        head = await rt.read_file("mod.py", end_line=2)
+        self.assertIn("[mod.py: lines 1-2 of 50]", head)
+        clamped = await rt.read_file("mod.py", start_line=40, end_line=400)
+        self.assertIn("[mod.py: lines 40-50 of 50]", clamped)
+        past = await rt.read_file("mod.py", start_line=51)
+        self.assertTrue(past.startswith("Error:"))
+        inverted = await rt.read_file("mod.py", start_line=10, end_line=5)
+        self.assertTrue(inverted.startswith("Error:"))
+
+    async def test_steering_note_fires_only_on_unbounded_large_reads(self):
+        big = "x" * (rt.LARGE_READ_NOTE_BYTES + 100) + "\n"
+        (self.jail / "big.txt").write_text(big, encoding="utf-8")
+
+        unbounded = await rt.read_file("big.txt")
+        self.assertIn("start_line/end_line", unbounded)
+        self.assertIn("get_function_boundary", unbounded)
+        # Appended AFTER the wrapper so it reads as harness guidance, not as
+        # part of the (attacker-controlled) file content.
+        self.assertGreater(
+            unbounded.index("start_line/end_line"),
+            unbounded.index(UNTRUSTED_DATA_END),
+        )
+
+        ranged = await rt.read_file("big.txt", start_line=1, end_line=1)
+        self.assertNotIn("[NOTE: this file is", ranged)
+        small = await rt.read_file("mod.py")
+        self.assertNotIn("[NOTE: this file is", small)
+
+
 class TestInv1EvidenceGate(unittest.IsolatedAsyncioTestCase):
     """Section B: INV-1 reached-sink evidence gate and verification."""
 

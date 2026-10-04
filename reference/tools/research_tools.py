@@ -25,6 +25,13 @@ logger = logging.getLogger(__name__)
 
 MAX_READ_SIZE = 1024 * 1024  # 1 MiB
 
+# Unbounded disk reads larger than this get a steering note appended. At
+# roughly 4 bytes per token, a 128 KiB file costs ~32k tokens of context for
+# ONE tool response -- usually to look at a handful of functions. The note
+# points at read_file's start_line/end_line parameters and at
+# get_function_boundary; it never truncates anything (MAX_READ_SIZE does).
+LARGE_READ_NOTE_BYTES = 128 * 1024
+
 # Maximum directory entries returned by list_files in a single response.
 #
 # A listing is not a file: truncating a file still leaves useful content, but an
@@ -86,8 +93,15 @@ def _persist_artifact(ctx, artifact_type: str, filepath: str, content: str):
         record_artifact(resolved_db, ctx.run_id, artifact_type, filepath, content, metadata=meta)
 
 
-async def read_file(filepath: str) -> str:
-    """Reads content from the SQLite campaign artifact store or the sandboxed execution context."""
+async def read_file(filepath: str, start_line: int = 0, end_line: int = 0) -> str:
+    """Reads content from the SQLite campaign artifact store or the sandboxed execution context.
+
+    Args:
+        filepath: Path of the file to read, relative to the target root.
+        start_line: Optional first line to return, 1-indexed (0 = from the start).
+            Line ranges apply to on-disk source files, not workspace artifacts.
+        end_line: Optional last line to return, 1-indexed inclusive (0 = to the end).
+    """
     ctx = current_run_context.get()
     if ctx is None:
         return "Error: No active execution context."
@@ -168,9 +182,33 @@ async def read_file(filepath: str) -> str:
     try:
         content_bytes = await sandbox.read_file(Path(clean_path))
         text = content_bytes.decode("utf-8", errors="replace")
+        full_len = len(text)
+        header = ""
+        if start_line > 0 or end_line > 0:
+            lines = text.splitlines(keepends=True)
+            total = len(lines)
+            lo = start_line if start_line > 0 else 1
+            hi = end_line if end_line > 0 else total
+            if lo > total:
+                return f"Error: start_line {lo} is past the end of '{clean_path}' ({total} lines)."
+            if hi < lo:
+                return f"Error: end_line {hi} is before start_line {lo}."
+            hi = min(hi, total)
+            text = "".join(lines[lo - 1:hi])
+            # The range header is harness bookkeeping, not file content, so it
+            # stays outside the untrusted-content wrapper below.
+            header = f"[{clean_path}: lines {lo}-{hi} of {total}]\n"
         if len(text) > MAX_READ_SIZE:
             text = text[:MAX_READ_SIZE] + f"\n\n[TRUNCATED: File exceeds {MAX_READ_SIZE} characters/bytes limit]"
-        return wrap_untrusted_content(text, filename=clean_path)
+        result = header + wrap_untrusted_content(text, filename=clean_path)
+        if not header and full_len > LARGE_READ_NOTE_BYTES:
+            result += (
+                f"\n[NOTE: this file is {full_len} characters. For focused "
+                "follow-ups, re-read with start_line/end_line, or use "
+                "get_function_boundary (when available) to fetch one "
+                "function's exact extent instead of the whole file.]"
+            )
+        return result
     except (PermissionError, FileNotFoundError) as e:
         return f"Error: {e}"
     except Exception as e:

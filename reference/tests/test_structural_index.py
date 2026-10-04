@@ -342,6 +342,16 @@ class ToolsTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("helper", out)
         self.assertIn("external or not indexed", out)
 
+    def test_zero_callers_carries_reachability_caveat(self):
+        # 'run' calls helper but nothing calls 'run': the empty result must
+        # prompt a reachability check without inviting blanket dismissal of
+        # entrypoints that legitimately have no in-index callers.
+        from tools.structural_tools import find_callers
+        out = find_callers("run")
+        self.assertIn("No recorded callers", out)
+        self.assertIn("0 direct call sites", out)
+        self.assertIn("route handler", out)
+
     async def test_boundary_returns_wrapped_source(self):
         from core.llm_gateway import UNTRUSTED_DATA_START
         from tools.structural_tools import get_function_boundary
@@ -502,6 +512,46 @@ class StructuralIndexNodeTest(unittest.IsolatedAsyncioTestCase):
         bad.write_text(json.dumps(self._spec("some_other_agent")))
         with self.assertRaises(ValueError):
             load_workflow_from_json(str(bad), load_local=False)
+
+
+class MacroIndexingTest(unittest.TestCase):
+    """C preprocessor definitions are indexed as 'macro' symbols so a
+    reviewer can check whether a #define changes the semantics a finding
+    relies on (e.g. a macro that discards its argument)."""
+
+    C_FILE = (
+        "#define PORT_ZERO 0\n"
+        "#define get_port(ctx) (PORT_ZERO)\n"
+        "\n"
+        "int pick(int *arr) {\n"
+        "    return arr[get_port(0)];\n"
+        "}\n"
+    )
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix="mantis_sidx_macro_")
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = Path(os.path.realpath(self._tmp.name))
+        self.code = self.tmp / "code"
+        (self.code / "src").mkdir(parents=True)
+        (self.code / "src" / "port.c").write_text(self.C_FILE)
+        self.state = str(self.tmp / "state")
+        build_structural_index(str(self.code), self.state, "snapm")
+
+    def test_macros_are_indexed_with_kind_macro(self):
+        idx = StructuralIndex(self.state)
+        plain = idx.resolve_symbol("PORT_ZERO")
+        self.assertEqual(plain["total"], 1)
+        self.assertEqual(plain["results"][0]["kind"], "macro")
+        fn_like = idx.resolve_symbol("get_port")
+        self.assertEqual(fn_like["total"], 1)
+        self.assertEqual(fn_like["results"][0]["kind"], "macro")
+
+    def test_macro_line_resolves_as_boundary(self):
+        idx = StructuralIndex(self.state)
+        res = idx.get_function_boundary("src/port.c", 2)
+        self.assertTrue(res["found"])
+        self.assertEqual(res["qualified_name"], "get_port")
 
 
 class WorkflowTopologyTest(unittest.TestCase):
