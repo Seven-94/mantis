@@ -316,6 +316,187 @@ class TestRangedReadAndLargeReadNote(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("[NOTE: this file is", small)
 
 
+class TestCitationVerificationGate(unittest.TestCase):
+    """report_findings' deterministic anti-hallucination citation gate.
+
+    Rejects only what is provably false against the host checkout --
+    nonexistent cited files, line numbers past a real file's end, symbols
+    absent from the cited file's text -- and saves everything unverifiable
+    unchanged, so a degraded environment can never block real findings
+    (fail-open) while a fabricated citation can never enter the findings
+    database (fail-closed).
+    """
+
+    APP_LINES = [
+        "import os",
+        "",
+        "def handle_login(user, password):",
+        "    token = os.environ.get('SECRET')",
+        "    return token",
+        "",
+        "def render_page(data):",
+        "    return '<html>' + data + '</html>'",
+        "",
+        "MARKER = True",
+    ]
+
+    def setUp(self):
+        self.tmp_dir = tempfile.mkdtemp(prefix="mantis_test_citation_")
+        self.jail = Path(self.tmp_dir)
+        (self.jail / "app.py").write_text("\n".join(self.APP_LINES) + "\n", encoding="utf-8")
+        self.db_path = str(self.jail / "knowledge.db")
+        init_db(self.db_path)
+        self.ctx = RunContext(
+            jail_dir=str(self.jail),
+            db_path=self.db_path,
+            target_file=str(self.jail),
+            run_id="citation_run",
+        )
+        self.token = current_run_context.set(self.ctx)
+
+    def tearDown(self):
+        current_run_context.reset(self.token)
+        import shutil
+        shutil.rmtree(self.tmp_dir, ignore_errors=True)
+
+    def _saved(self):
+        from core.database import read_findings
+        return read_findings(self.db_path, run_id="citation_run")
+
+    def test_hallucinated_filepath_is_rejected_and_nothing_saved(self):
+        res = rt.report_findings([
+            {"title": "Ghost", "filepath": "services/ghost.py", "line_numbers": [3]}
+        ])
+        self.assertIn("NOT saved", res)
+        self.assertIn("does not resolve to a file", res)
+        self.assertEqual(len(self._saved()), 0)
+
+    def test_out_of_range_line_number_is_rejected(self):
+        res = rt.report_findings([
+            {"title": "FarLine", "filepath": "app.py", "line_numbers": [999]}
+        ])
+        self.assertIn("out of range", res)
+        self.assertIn("(10 lines)", res)
+        self.assertEqual(len(self._saved()), 0)
+
+    def test_absent_symbol_and_past_eof_code_paths_are_rejected(self):
+        res = rt.report_findings([
+            {"title": "NoSym", "filepath": "app.py", "line_numbers": [3],
+             "code_paths": ["app.py:frobnicate_quux"]},
+            {"title": "FarRef", "filepath": "app.py", "line_numbers": [3],
+             "code_paths": ["app.py:500"]},
+        ])
+        self.assertIn("does not appear", res)
+        self.assertIn("past the end", res)
+        self.assertEqual(len(self._saved()), 0)
+
+    def test_valid_citations_save_and_unverifiable_entries_are_ignored(self):
+        res = rt.report_findings([
+            {"title": "Real", "filepath": "app.py", "line_numbers": [4],
+             "code_paths": [
+                 "app.py:handle_login",
+                 "app.py:4",
+                 "see data flow: user input -> template",
+                 "https://example.com/advisory:42",
+             ]}
+        ])
+        self.assertTrue(res.startswith("SUCCESS"), res)
+        self.assertEqual(len(self._saved()), 1)
+
+    def test_deeper_base_citation_is_repaired_to_jail_relative(self):
+        res = rt.report_findings([
+            {"title": "Rebased", "filepath": "vendor/pkg/app.py", "line_numbers": [3]}
+        ])
+        self.assertTrue(res.startswith("SUCCESS"), res)
+        rows = self._saved()
+        self.assertEqual(len(rows), 1)
+        stored = str(rows[0].get("filepath") or "")
+        self.assertTrue(stored.endswith("app.py"), stored)
+        self.assertNotIn("vendor", stored)
+
+    def test_without_host_checkout_the_gate_fails_open(self):
+        ghost_ctx = RunContext(
+            jail_dir=str(self.jail / "nonexistent_subdir"),
+            db_path=self.db_path,
+            target_file=str(self.jail),
+            run_id="citation_run",
+        )
+        tok = current_run_context.set(ghost_ctx)
+        try:
+            res = rt.report_findings([
+                {"title": "Unverifiable", "filepath": "no/such/file.py", "line_numbers": [1]}
+            ])
+        finally:
+            current_run_context.reset(tok)
+        self.assertTrue(res.startswith("SUCCESS"), res)
+
+    def test_three_part_code_paths_verify_line_and_symbol(self):
+        ok = rt.report_findings([
+            {"title": "ThreePart", "filepath": "app.py", "line_numbers": [3],
+             "code_paths": ["app.py:3:handle_login"]}
+        ])
+        self.assertTrue(ok.startswith("SUCCESS"), ok)
+
+        bad_line = rt.report_findings([
+            {"title": "ThreePartFar", "filepath": "app.py", "line_numbers": [3],
+             "code_paths": ["app.py:999:handle_login"]}
+        ])
+        self.assertIn("past the end", bad_line)
+
+        bad_sym = rt.report_findings([
+            {"title": "ThreePartGhost", "filepath": "app.py", "line_numbers": [3],
+             "code_paths": ["app.py:3:ghost_symbol_xyz"]}
+        ])
+        self.assertIn("does not appear", bad_sym)
+
+    def test_target_relative_citation_resolves_and_repairs(self):
+        app_dir = self.jail / "app"
+        app_dir.mkdir()
+        (app_dir / "database.py").write_text(
+            "def find_user(q):\n    return q\n", encoding="utf-8"
+        )
+        sub_ctx = RunContext(
+            jail_dir=str(self.jail),
+            db_path=self.db_path,
+            target_file=str(app_dir),
+            run_id="citation_run",
+        )
+        tok = current_run_context.set(sub_ctx)
+        try:
+            res = rt.report_findings([
+                {"title": "TargetRel", "filepath": "database.py", "line_numbers": [1],
+                 "code_paths": ["database.py:find_user"]}
+            ])
+        finally:
+            current_run_context.reset(tok)
+        self.assertTrue(res.startswith("SUCCESS"), res)
+        rows = self._saved()
+        self.assertEqual(len(rows), 1)
+        stored = str(rows[0].get("filepath") or "")
+        self.assertTrue(stored.endswith("database.py"), stored)
+        self.assertIn("app", stored)
+
+    def test_protected_citations_are_never_an_oracle(self):
+        (self.jail / ".env").write_text("SECRET_TOKEN=abc\n", encoding="utf-8")
+        res = rt.report_findings([
+            {"title": "EnvProbe", "filepath": ".env", "line_numbers": [999],
+             "code_paths": [".env:SECRET_TOKEN", ".git/config:core"]}
+        ])
+        # Saved unchallenged: no existence, line-count, or content signal
+        # ever comes back for protected paths.
+        self.assertTrue(res.startswith("SUCCESS"), res)
+
+    def test_hardlinked_citation_is_unverifiable_not_an_oracle(self):
+        try:
+            os.link(str(self.jail / "app.py"), str(self.jail / "linked.py"))
+        except OSError as exc:
+            self.skipTest(f"hardlinks unavailable: {exc}")
+        res = rt.report_findings([
+            {"title": "LinkProbe", "filepath": "linked.py", "line_numbers": [999]}
+        ])
+        self.assertTrue(res.startswith("SUCCESS"), res)
+
+
 class TestInv1EvidenceGate(unittest.IsolatedAsyncioTestCase):
     """Section B: INV-1 reached-sink evidence gate and verification."""
 

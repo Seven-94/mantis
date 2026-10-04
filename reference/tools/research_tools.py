@@ -220,6 +220,195 @@ async def read_file(filepath: str, start_line: int = 0, end_line: int = 0) -> st
         return f"Error reading file '{filepath}': {e}"
 
 
+# --- Deterministic citation verification ---------------------------------------
+#
+# report_findings rejects provably false citations BEFORE they enter the
+# database: a filepath that resolves to no file under the jail, a line number
+# past the end of a real file, a symbol token that appears nowhere in the
+# cited file's text. Each check first establishes that it can see the ground
+# truth; anything unverifiable (no host checkout, oversized or undecodable
+# file, prose-like code_paths entry) is skipped, because "cannot check" and
+# "wrong" are different things and conflating them would block real findings
+# whenever the environment degrades. The symbol check is deliberately textual
+# rather than catalog-backed: a structural-index miss can be a local variable
+# or an unindexed language, but an identifier absent from the file itself is
+# a hallucination by definition.
+
+# Cap on problems quoted back to the agent; checking itself is never capped.
+MAX_CITATION_PROBLEMS = 5
+
+# Line and symbol checks skip files above this size: not source code, and
+# reading them on every report would cost more than the check is worth.
+MAX_CITATION_CHECK_BYTES = 8 * 1024 * 1024
+
+_IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _jail_file(jail_root: str, rel_path: str) -> Optional[str]:
+    """Resolves a cited path to a real file under the jail root, else None."""
+    clean = str(rel_path or "").replace("\\", "/").removeprefix("./").strip().lstrip("/")
+    if not clean or "://" in clean:
+        return None
+    cand = os.path.realpath(os.path.join(jail_root, clean))
+    if cand != jail_root and not cand.startswith(jail_root + os.sep):
+        return None
+    return cand if os.path.isfile(cand) else None
+
+
+def _protected_citation(rel_path: str) -> bool:
+    """True when a citation names VCS internals or credential metadata.
+
+    read_file refuses these through the sandbox, so the verifier must not
+    become an oracle for them: a protected citation is treated as
+    unverifiable (skipped entirely), never resolved, opened, or line-counted.
+    """
+    parts = [p for p in str(rel_path or "").replace("\\", "/").split("/") if p]
+    if not parts:
+        return False
+    return any(p in PROTECTED_VCS_DIRS for p in parts) or parts[-1] in PROTECTED_METADATA_FILES
+
+
+def _resolve_citation(jail_root: str, rel_path: str, base_rel: str = "") -> "tuple[Optional[str], str]":
+    """(host path, jail-relative path) for a citation.
+
+    Tolerates the two citation bases seen in real runs. A path cited from a
+    DEEPER base (the jail's own directory name prefixed, a vendored subtree)
+    resolves by stripping leading components; a path cited relative to the
+    campaign's target subdirectory (base_rel, e.g. an eval target 'app/')
+    resolves by prefixing it. The returned jail-relative path is the one the
+    rest of the pipeline -- read_file under the same jail -- can open, so
+    the caller can repair the stored citation to it.
+    """
+    probe = str(rel_path or "").replace("\\", "/").removeprefix("./").strip().lstrip("/")
+    while True:
+        host = _jail_file(jail_root, probe)
+        if host is not None:
+            return host, probe
+        if base_rel:
+            based = f"{base_rel}/{probe}"
+            host = _jail_file(jail_root, based)
+            if host is not None:
+                return host, based
+        if "/" not in probe:
+            return None, probe
+        probe = probe.split("/", 1)[1]
+
+
+def _citation_text(host_path: str) -> Optional[str]:
+    """File text for citation checks, or None when unverifiable."""
+    try:
+        st = os.stat(host_path)
+        # Oversized is not source code; a multi-link file can alias content
+        # from outside the jail onto an in-jail name. Neither is checkable.
+        if st.st_size > MAX_CITATION_CHECK_BYTES or st.st_nlink > 1:
+            return None
+        with open(host_path, "rb") as fh:
+            return fh.read().decode("utf-8", errors="replace")
+    except OSError:
+        return None
+
+
+def _check_finding_citations(f: Any, idx: int, jail_root: str, base_rel: str, problems: "list[str]") -> None:
+    """Appends one message per provably false citation in a single finding."""
+    f_dict = f.model_dump() if hasattr(f, "model_dump") else (f if isinstance(f, dict) else dict(f))
+    title = f_dict.get("title") or f"Finding #{idx + 1}"
+    fp = str(f_dict.get("filepath") or "").strip()
+    if fp and not _protected_citation(fp):
+        host, repaired = _resolve_citation(jail_root, fp, base_rel)
+        if host is None:
+            problems.append(
+                f"Finding '{title}': filepath '{fp}' does not resolve to a file in the target"
+            )
+        else:
+            clean_fp = fp.replace("\\", "/").removeprefix("./").lstrip("/")
+            if repaired != clean_fp:
+                # Resolvable only at a different base: store the path the
+                # rest of the pipeline can actually open.
+                if hasattr(f, "filepath"):
+                    f.filepath = repaired
+                elif isinstance(f, dict):
+                    f["filepath"] = repaired
+            text = _citation_text(host)
+            if text is not None:
+                total = len(text.splitlines())
+                bad = [
+                    n for n in (f_dict.get("line_numbers") or [])
+                    if isinstance(n, int) and not (1 <= n <= total)
+                ]
+                if bad:
+                    problems.append(
+                        f"Finding '{title}': line_numbers {bad} out of range for '{fp}' ({total} lines)"
+                    )
+    for cp in f_dict.get("code_paths") or []:
+        entry = str(cp).strip()
+        if ":" not in entry or "://" in entry or " " in entry:
+            continue  # prose or a URL, not a checkable path:line / path:symbol
+        path_part, token = entry.rsplit(":", 1)
+        path_part, token = path_part.strip(), token.strip()
+        line_token = ""
+        if ":" in path_part:
+            # Third circulating shape, 'path:42:symbol' (see correlator's
+            # _symbols_from_code_paths): peel the line off so the path
+            # resolves and BOTH the line and the symbol get verified.
+            maybe_path, maybe_line = path_part.rsplit(":", 1)
+            if maybe_line.strip().isdigit():
+                path_part, line_token = maybe_path.strip(), maybe_line.strip()
+        if not token or ("/" not in path_part and "." not in path_part):
+            continue
+        if _protected_citation(path_part):
+            continue
+        host, _ = _resolve_citation(jail_root, path_part, base_rel)
+        if host is None:
+            problems.append(
+                f"Finding '{title}': code_paths entry '{entry}' cites a file that does not exist in the target"
+            )
+            continue
+        text = _citation_text(host)
+        if text is None:
+            continue
+        total = len(text.splitlines())
+        for cited_line in (int(t) for t in (token, line_token) if t.isdigit()):
+            if not (1 <= cited_line <= total):
+                problems.append(
+                    f"Finding '{title}': code_paths entry '{entry}' is past the end of the file ({total} lines)"
+                )
+                break
+        if not token.isdigit():
+            # 'path:Class.method' and 'path:func(...)' cite their last
+            # identifier; anything less identifier-like stays unchecked.
+            last = token.split(".")[-1].split("(")[0].strip()
+            if _IDENT_RE.fullmatch(last) and not re.search(rf"\b{re.escape(last)}\b", text):
+                problems.append(
+                    f"Finding '{title}': symbol '{token}' does not appear in '{path_part}'"
+                )
+
+
+def _citation_problems(findings: Any, jail_dir: str, target_file: str = "") -> "list[str]":
+    """Collects provably false citations across findings. Never raises."""
+    problems: "list[str]" = []
+    jail_root = os.path.realpath(jail_dir) if jail_dir and os.path.isdir(jail_dir) else ""
+    if not jail_root:
+        return problems
+    # Citations are routinely relative to the campaign's target subdirectory
+    # rather than the jail root (an eval target 'app/', a slice scan's
+    # 'server/routes'); resolving against both bases keeps those findings
+    # verifiable instead of falsely rejected.
+    base_rel = ""
+    try:
+        if target_file:
+            t_real = os.path.realpath(target_file)
+            if os.path.isdir(t_real) and t_real.startswith(jail_root + os.sep):
+                base_rel = os.path.relpath(t_real, jail_root).replace("\\", "/")
+    except OSError:
+        base_rel = ""
+    for i, f in enumerate(findings):
+        try:
+            _check_finding_citations(f, i, jail_root, base_rel, problems)
+        except Exception as exc:  # unverifiable is not wrong
+            logger.warning("Citation check skipped for finding %d: %r", i, exc)
+    return problems
+
+
 def report_findings(report: VulnerabilityReport) -> str:
     """Submit the structured report of all vulnerabilities found in the file."""
     ctx = current_run_context.get()
@@ -292,6 +481,23 @@ def report_findings(report: VulnerabilityReport) -> str:
                         f"and line numbers where the flaw occurs (e.g. line_numbers=[149]). "
                         f"Please specify the file path and resubmit via report_findings."
                     )
+
+        # Deterministic citation gate, AFTER the repair pass so repaired
+        # paths are what gets verified. Fail-closed on provable falsehoods,
+        # fail-open on anything unverifiable -- see _citation_problems.
+        problems = list(dict.fromkeys(
+            _citation_problems(findings, ctx.jail_dir or "", ctx.target_file or "")
+        ))
+        if problems:
+            shown = "; ".join(problems[:MAX_CITATION_PROBLEMS])
+            extra = len(problems) - MAX_CITATION_PROBLEMS
+            suffix = f" (+{extra} more)" if extra > 0 else ""
+            return (
+                f"Error: citation verification failed and findings were NOT saved: {shown}{suffix}. "
+                "Re-read the cited files with read_file (use start_line/end_line) or "
+                "get_function_boundary, correct every citation, and resubmit the full "
+                "report via report_findings."
+            )
 
         write_findings(ctx.db_path, ctx.target_file, findings, run_id=ctx.run_id)
         return f"SUCCESS: Saved {len(findings)} finding(s) to database."
