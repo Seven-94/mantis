@@ -167,6 +167,25 @@ async def read_file(filepath: str, start_line: int = 0, end_line: int = 0) -> st
 
             return f"NO_DATA: File not found in workspace: {filepath}"
 
+    # A finding stored under --path-root carries the repo-relative spelling
+    # ("routes/login.ts") while this jail resolves against the scan target
+    # ("login.ts" under /repo/routes). Rebase the spelling so the gates
+    # below judge the file it actually names. Guarded three ways: only when
+    # the jail spelling does not exist, only when the repo spelling does,
+    # and only when it lands INSIDE the jail -- so the single-file gate
+    # still applies and nothing outside the jail becomes readable.
+    _root = str(getattr(ctx, "path_root", "") or "")
+    if _root and clean_path and ctx.jail_dir:
+        try:
+            _jail_real = os.path.realpath(ctx.jail_dir)
+            _cand = os.path.realpath(os.path.join(_root, clean_path))
+            if (not os.path.exists(os.path.join(ctx.jail_dir, clean_path))
+                    and os.path.isfile(_cand)
+                    and _cand.startswith(_jail_real + os.sep)):
+                clean_path = os.path.relpath(_cand, _jail_real).replace(os.sep, "/")
+        except OSError:
+            pass
+
     if ctx.target_file and os.path.isfile(ctx.target_file) and ctx.jail_dir and clean_path:
         req_target = os.path.realpath(os.path.join(ctx.jail_dir, clean_path))
         real_target = os.path.realpath(ctx.target_file)
@@ -383,7 +402,8 @@ def _check_finding_citations(f: Any, idx: int, jail_root: str, base_rel: str, pr
                 )
 
 
-def _citation_problems(findings: Any, jail_dir: str, target_file: str = "") -> "list[str]":
+def _citation_problems(findings: Any, jail_dir: str, target_file: str = "",
+                       path_root: str = "") -> "list[str]":
     """Collects provably false citations across findings. Never raises."""
     problems: "list[str]" = []
     jail_root = os.path.realpath(jail_dir) if jail_dir and os.path.isdir(jail_dir) else ""
@@ -401,6 +421,21 @@ def _citation_problems(findings: Any, jail_dir: str, target_file: str = "") -> "
                 base_rel = os.path.relpath(t_real, jail_root).replace("\\", "/")
     except OSError:
         base_rel = ""
+    # Rebase to the operator-declared repository root when it encloses the
+    # jail (--path-root): repo-relative citations -- the very form
+    # canonical_filepath now stores -- then resolve directly instead of
+    # being "repaired" down to basenames, and the old jail root becomes the
+    # secondary base so jail-relative spellings keep resolving too.
+    try:
+        if path_root:
+            p_real = os.path.realpath(path_root)
+            if (os.path.isdir(p_real) and p_real != jail_root
+                    and jail_root.startswith(p_real + os.sep)):
+                jail_prefix = os.path.relpath(jail_root, p_real).replace("\\", "/")
+                base_rel = f"{jail_prefix}/{base_rel}" if base_rel else jail_prefix
+                jail_root = p_real
+    except OSError:
+        pass
     for i, f in enumerate(findings):
         try:
             _check_finding_citations(f, i, jail_root, base_rel, problems)
@@ -486,7 +521,8 @@ def report_findings(report: VulnerabilityReport) -> str:
         # paths are what gets verified. Fail-closed on provable falsehoods,
         # fail-open on anything unverifiable -- see _citation_problems.
         problems = list(dict.fromkeys(
-            _citation_problems(findings, ctx.jail_dir or "", ctx.target_file or "")
+            _citation_problems(findings, ctx.jail_dir or "", ctx.target_file or "",
+                               getattr(ctx, "path_root", "") or "")
         ))
         if problems:
             shown = "; ".join(problems[:MAX_CITATION_PROBLEMS])

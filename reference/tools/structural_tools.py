@@ -250,6 +250,29 @@ async def get_function_boundary(filepath: str, line: int) -> str:
         # catalog path that is actually read below, so a suffix spelling
         # of some other file cannot dodge the jail.
         resolved = res["file_path"]
+        # The catalog is rooted at path_root when the operator declared one
+        # (see create_structural_index_node), while this jail may be a
+        # slice of that repository. Rebase the catalog path to the jail so
+        # the gate and the sandbox read below judge the file it actually
+        # names. A catalog row outside the jail is structural context, not
+        # readable source: refuse it outright rather than hand the sandbox
+        # a spelling that a same-named file inside the jail could alias.
+        _root = str(getattr(ctx, "path_root", "") or "")
+        if _root and resolved and ctx.jail_dir:
+            try:
+                _jail_real = os.path.realpath(ctx.jail_dir)
+                _cand = os.path.realpath(os.path.join(_root, resolved))
+                if (os.path.isfile(_cand)
+                        and not os.path.exists(os.path.join(ctx.jail_dir, resolved))):
+                    if not _cand.startswith(_jail_real + os.sep):
+                        return (
+                            "Error: Permission denied. "
+                            f"'{resolved}' lies outside the scan target; it "
+                            "is indexed for structural context only."
+                        )
+                    resolved = os.path.relpath(_cand, _jail_real).replace(os.sep, "/")
+            except OSError:
+                pass
         if ctx.target_file and os.path.isfile(ctx.target_file) and ctx.jail_dir and resolved:
             req_target = os.path.realpath(os.path.join(ctx.jail_dir, resolved))
             real_target = os.path.realpath(ctx.target_file)
@@ -272,7 +295,7 @@ async def get_function_boundary(filepath: str, line: int) -> str:
             from core.environments.static_env import StaticOnlyEnvironment
             sandbox = StaticOnlyEnvironment(target_path=target)
         try:
-            content_bytes = await sandbox.read_file(Path(res["file_path"]))
+            content_bytes = await sandbox.read_file(Path(resolved))
         except Exception as e:
             if ctx.sandbox is not None:
                 return f"Error: sandbox read failed for '{res['file_path']}': {type(e).__name__}: {e}"

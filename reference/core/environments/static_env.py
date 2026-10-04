@@ -109,9 +109,28 @@ class StaticOnlyEnvironment(BaseEnvironment):
 
         if os.path.isfile(real_target):
             if resolved_target != real_target:
-                raise PermissionError(
-                    f"Permission denied. Single-file scans may only read the scanned file '{os.path.basename(real_target)}'."
-                )
+                # A run under --path-root stores finding paths relative to
+                # the declared repository root ("routes/login.ts"), while
+                # this jail's base is the file's parent -- so the stored
+                # spelling re-resolves to ".../routes/routes/login.ts" and
+                # would be refused. Accept a spelling that resolves to the
+                # scanned file itself via path_root; everything else stays
+                # refused, so no sibling file becomes readable.
+                alt = ""
+                if not os.path.isabs(path_str):
+                    try:
+                        from core.context import current_run_context
+                        rc = current_run_context.get()
+                        root = str(getattr(rc, "path_root", "") or "") if rc else ""
+                    except Exception:
+                        root = ""
+                    if root:
+                        alt = os.path.realpath(os.path.join(root, path_str))
+                if alt != real_target:
+                    raise PermissionError(
+                        f"Permission denied. Single-file scans may only read the scanned file '{os.path.basename(real_target)}'."
+                    )
+                resolved_target = alt
         else:
             try:
                 if os.path.commonpath([real_target, resolved_target]) != real_target:

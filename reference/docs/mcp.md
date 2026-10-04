@@ -155,6 +155,10 @@ after the pipeline finishes, the server rebuilds the shared structural index
 rooted at the repository, because the per-file scan re-roots it at the scanned
 file, which would otherwise blind the gate's blast radius.
 
+Scans pass `--path-root` so findings store repository-relative filepaths
+(`routes/login.ts`, not the ambiguous basename `login.ts` that two same-named
+files could cross-match).
+
 ## State
 
 Everything lives in `.mantis/` at the repository root: `knowledge.db` (the same

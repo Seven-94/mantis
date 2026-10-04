@@ -105,13 +105,16 @@ def canonical_filepath(fp: str, target_file: str = "") -> str:
     while tf_clean.startswith("./"):
         tf_clean = tf_clean[2:]
 
-    # Retrieve active context jail_dir / target_file if available
+    # Retrieve active context jail_dir / path_root if available
     jail_dir = ""
+    path_root = ""
     try:
         from core.context import current_run_context
         ctx = current_run_context.get()
         if ctx and getattr(ctx, "jail_dir", None):
             jail_dir = str(ctx.jail_dir).replace("\\", "/").rstrip("/")
+        if ctx and getattr(ctx, "path_root", ""):
+            path_root = str(ctx.path_root).replace("\\", "/").rstrip("/")
     except Exception:
         pass
 
@@ -122,7 +125,12 @@ def canonical_filepath(fp: str, target_file: str = "") -> str:
     def _relativize(path: str) -> str:
         if not os.path.isabs(path):
             return path
-        candidates = [jail_dir]
+        # path_root outranks the jail: for a single-file scan the jail is the
+        # file's parent directory, which collapses the repo prefix out of
+        # every path it anchors ("routes/login.ts" -> "login.ts"). The
+        # operator-declared repository root is the only base that can keep
+        # the prefix, so when it is set it speaks first.
+        candidates = [path_root, jail_dir]
         if target_dir and os.path.isabs(target_dir):
             candidates.append(target_dir)
         candidates.append(os.getcwd().replace("\\", "/"))

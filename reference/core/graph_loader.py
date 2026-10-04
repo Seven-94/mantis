@@ -585,7 +585,13 @@ def create_structural_index_node(node_id: str):
             from core.paths import resolve_db_path
             from core.structural_index import build_structural_index, state_dir_for_db
 
-            jail = getattr(rc, "jail_dir", None) or ""
+            # The operator-declared repository root outranks the jail: a
+            # single-file scan's jail is the file's parent directory, and
+            # indexing that would re-root the shared catalog at a
+            # subdirectory -- cross-directory callers vanish for the
+            # researcher during the scan and for every catalog consumer
+            # after it.
+            jail = getattr(rc, "path_root", "") or getattr(rc, "jail_dir", None) or ""
             db_path = (getattr(rc, "db_path", None) or ctx.state.get("db_path") or "")
             if not jail or not db_path:
                 msg = "Structural index skipped: no target checkout in context."

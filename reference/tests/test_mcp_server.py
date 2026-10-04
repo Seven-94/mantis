@@ -289,10 +289,25 @@ class TestGateVerdicts(unittest.TestCase):
             self.state, fid, "false_positive", "I disagree")
         self.assertFalse(res["applied"], res)
         self.assertEqual(res["new_status"].lower(), "dynamic_confirmed")
+        self.assertIn("machine-verified", res["note"])
         # A fix is not a dismissal: mitigated IS allowed over machine proof.
         res = mcp_server.resolve_finding(
             self.state, fid, "mitigated", "fixed and deployed")
         self.assertTrue(res["applied"], res)
+
+    def test_terminal_refusal_note_names_the_status_not_the_machine(self):
+        """Re-closing an already-dismissed finding is refused because the
+        row is terminal -- the note must say that, not blame machine
+        evidence that was never there."""
+        self._write_finding("HIGH")
+        fid = mcp_server.get_findings(self.state)["findings"][0]["id"]
+        self.assertTrue(mcp_server.resolve_finding(
+            self.state, fid, "false_positive", "wrong file entirely")["applied"])
+        res = mcp_server.resolve_finding(
+            self.state, fid, "mitigated", "changed my mind, I fixed it")
+        self.assertFalse(res["applied"], res)
+        self.assertIn("false_positive", res["note"])
+        self.assertNotIn("machine-verified", res["note"])
 
     def test_resolve_rejects_dishonest_or_empty_input(self):
         self._write_finding("HIGH")
@@ -363,6 +378,9 @@ class TestScanCommand(unittest.TestCase):
         self.assertEqual(cmd[2], "/t/app.py")
         self.assertIn("--db", cmd)
         self.assertIn("--yes", cmd)
+        # The anchor that keeps stored finding paths repo-relative instead of
+        # bare basenames, which same-named files could cross-match.
+        self.assertEqual(cmd[cmd.index("--path-root") + 1], str(self.state.repo))
         self.assertEqual(cmd[cmd.index("--max-llm-calls") + 1], "99")
         self.assertEqual(cmd[cmd.index("--model") + 1], "some-model")
 

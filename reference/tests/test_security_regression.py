@@ -414,6 +414,42 @@ class TestCitationVerificationGate(unittest.TestCase):
         self.assertTrue(stored.endswith("app.py"), stored)
         self.assertNotIn("vendor", stored)
 
+    def test_path_root_keeps_repo_relative_citations(self):
+        """A single-file scan under --path-root: the jail is the file's
+        parent, the context names the repository root, and the agent cites
+        the repo-relative spelling. The gate must verify that spelling
+        against the repository instead of "repairing" it down to a
+        basename, and must repair the bare spelling UP to repo-relative --
+        both matching what canonical_filepath stores.
+        """
+        sub = self.jail / "routes"
+        sub.mkdir()
+        (sub / "login.py").write_text("\n".join(self.APP_LINES) + "\n",
+                                      encoding="utf-8")
+        file_ctx = RunContext(
+            jail_dir=str(sub),
+            db_path=self.db_path,
+            target_file=str(sub / "login.py"),
+            run_id="citation_run",
+            path_root=str(self.jail),
+        )
+        token = current_run_context.set(file_ctx)
+        try:
+            res = rt.report_findings([
+                {"title": "RepoRel", "filepath": "routes/login.py",
+                 "line_numbers": [4],
+                 "code_paths": ["routes/login.py:handle_login"]},
+                {"title": "JailRel", "filepath": "login.py",
+                 "line_numbers": [4]},
+            ])
+            self.assertTrue(res.startswith("SUCCESS"), res)
+        finally:
+            current_run_context.reset(token)
+        rows = {str(r.get("title")): str(r.get("filepath") or "")
+                for r in self._saved()}
+        self.assertEqual(rows.get("RepoRel"), "routes/login.py")
+        self.assertEqual(rows.get("JailRel"), "routes/login.py")
+
     def test_without_host_checkout_the_gate_fails_open(self):
         ghost_ctx = RunContext(
             jail_dir=str(self.jail / "nonexistent_subdir"),
@@ -10041,3 +10077,63 @@ class TestMicrosandboxAutoPromotion(unittest.IsolatedAsyncioTestCase):
             "missing image fails every campaign after preflight already said OK",
         )
 
+
+
+class TestPathRootCanonicalization(unittest.TestCase):
+    """Finding paths must anchor at the repository, not at the scanned file.
+
+    A single-file scan knows only the file: the jail is the file's parent
+    directory, so `canonical_filepath` stored "login.ts" where the repository
+    said "routes/login.ts". A bare basename is ambiguous -- two same-named
+    files in one repository cross-match at any consumer that compares paths
+    (found dogfooding the MCP gate against Juice Shop, which has exactly
+    such collisions). `RunContext.path_root` is the caller-declared anchor;
+    these tests pin both the fix and the INV-6 fallback without it.
+    """
+
+    def setUp(self):
+        import tempfile
+
+        from core.context import RunContext, current_run_context
+
+        self.tmp = os.path.realpath(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.repo = os.path.join(self.tmp, "repo")
+        os.makedirs(os.path.join(self.repo, "routes"))
+        self.target = os.path.join(self.repo, "routes", "login.ts")
+        with open(self.target, "w", encoding="utf-8") as fh:
+            fh.write("export function login() {}\n")
+        # Exactly the shape a single-file pipeline run produces: the jail is
+        # the file's parent, which is what erased the repo prefix.
+        self._ctx = RunContext(
+            jail_dir=os.path.dirname(self.target),
+            db_path=os.path.join(self.tmp, "k.db"),
+            path_root=self.repo,
+        )
+        self._var = current_run_context
+        self._token = current_run_context.set(self._ctx)
+        self.addCleanup(current_run_context.reset, self._token)
+
+    def _canon(self, fp, target_file=None):
+        from core.database import canonical_filepath
+
+        return canonical_filepath(
+            fp, target_file=self.target if target_file is None else target_file
+        )
+
+    def test_bare_basename_regains_its_repo_prefix(self):
+        """The dogfood regression: the model reports the file it was shown."""
+        self.assertEqual(self._canon("login.ts"), "routes/login.ts")
+
+    def test_absolute_path_relativizes_against_the_root(self):
+        self.assertEqual(self._canon(self.target), "routes/login.ts")
+
+    def test_without_path_root_the_old_behavior_is_untouched(self):
+        """INV-6: absence of the anchor is the pre-field behavior, bit for bit."""
+        self._ctx.path_root = ""
+        self.assertEqual(self._canon("login.ts"), "login.ts")
+
+    def test_a_path_outside_the_root_is_not_forced_under_it(self):
+        """relpath would happily fabricate ../../etc/passwd; the candidate
+        loop must reject the escape and fall through unchanged."""
+        self.assertEqual(self._canon("/etc/passwd"), "/etc/passwd")

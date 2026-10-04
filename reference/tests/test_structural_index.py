@@ -475,6 +475,42 @@ class StructuralIndexNodeTest(unittest.IsolatedAsyncioTestCase):
             (Path(state_dir_for_db(self.db)) / "catalog.sqlite").exists()
         )
 
+    async def test_node_prefers_path_root_over_jail(self):
+        """A single-file scan's jail is the file's parent directory;
+        indexing it would re-root the shared catalog at a subdirectory and
+        cross-directory callers would vanish mid-scan. With path_root in
+        the context the catalog must stay repo-rooted.
+        """
+        from core.graph_loader import create_structural_index_node
+        self.install_ctx(
+            jail_dir=str(self.code / "app"),
+            target_file=str(self.code / "app" / "auth.py"),
+            path_root=str(self.code),
+        )
+        n = create_structural_index_node("structural_index")
+        mock_ctx = MagicMock()
+        mock_ctx.state = {}
+        event = await n._func(mock_ctx, node_input=None)
+        self.assertIn("Structural index complete", event.output)
+        idx = StructuralIndex(state_dir_for_db(self.db))
+        # Repo-rooted paths resolve, including a file OUTSIDE the jail.
+        self.assertTrue(idx.enclosing_symbol("app/auth.py", 5).get("found"))
+        self.assertTrue(idx.enclosing_symbol("lib/util.js", 2).get("found"))
+
+        # The boundary tool must read source through the SAME repo-rooted
+        # catalog: its file_path is path_root-relative while the jail is
+        # the slice, so without the rebase the single-file gate silently
+        # skips and the sandbox read resolves app/app/auth.py.
+        from tools.structural_tools import get_function_boundary
+        for spelling in ("auth.py", "app/auth.py"):
+            out = await get_function_boundary(spelling, 5)
+            self.assertIn("def login", out, out)
+        # A catalog row outside the jail is structural context only:
+        # refused, never handed to the sandbox.
+        out = await get_function_boundary("lib/util.js", 2)
+        self.assertIn("Permission denied", out, out)
+        self.assertNotIn("function run", out, out)
+
     async def test_node_without_target_skips_and_routes_on(self):
         from core.graph_loader import create_structural_index_node
         self.install_ctx(jail_dir="")

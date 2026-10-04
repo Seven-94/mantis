@@ -308,9 +308,15 @@ def resolve_finding(state: MantisState, finding_id: int, resolution: str,
     out = {"finding_id": fid, "old_status": old_status,
            "new_status": new_status, "applied": applied}
     if not applied:
-        out["note"] = ("The monotonic status guard refused the transition: "
-                       "a dismissal never overwrites machine-verified "
-                       "evidence (dynamic_confirmed, patch_verified).")
+        if (res == "false_positive"
+                and old_status.lower() in ("dynamic_confirmed", "patch_verified")):
+            out["note"] = ("The monotonic status guard refused the transition: "
+                           "a dismissal never overwrites machine-verified "
+                           "evidence (dynamic_confirmed, patch_verified).")
+        else:
+            out["note"] = ("The monotonic status guard refused the transition: "
+                           f"'{old_status}' is already a terminal status and "
+                           "is preserved.")
     return out
 
 
@@ -529,7 +535,11 @@ def check_change(state: MantisState, files: Optional[List[str]] = None,
 def _scan_cmd(state: MantisState, target: str, max_llm_calls: int, model: str) -> List[str]:
     """The exact pipeline invocation for one changed file. Pure, for tests."""
     cmd = [sys.executable, str(_REF_ROOT / "main.py"), target,
-           "--db", state.db_path, "--yes"]
+           "--db", state.db_path, "--yes",
+           # Anchor finding filepaths at the repository: a single-file scan
+           # would otherwise store bare basenames ("login.ts"), which two
+           # same-named files in one repo could cross-match at the gate.
+           "--path-root", str(state.repo)]
     if max_llm_calls > 0:
         cmd += ["--max-llm-calls", str(max_llm_calls)]
     if model:

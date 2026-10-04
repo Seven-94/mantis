@@ -1012,6 +1012,7 @@ async def pipeline(
     parallel: int = 1,
     focus: str = "",
     seed_report_path: str = "",
+    path_root: str = "",
 ):
     """Main pipeline loop compiled declaratively from JSON specification."""
     if not workflow_path:
@@ -1109,6 +1110,25 @@ async def pipeline(
     # The jail stays the repository root even when scanning a slice: git history is a
     # whole-repository fact, and a slice-sized jail would make it unavailable.
     jail_dir = str(target_path.parent) if target_path.is_file() else str(target_path)
+    # --path-root: the caller's answer to "relative to WHAT?". A scan of one
+    # file knows only the file, so finding paths anchor at its parent and the
+    # repository prefix is lost ("routes/login.ts" stored as "login.ts");
+    # only the caller knows the enclosing repository. An anchor that is not
+    # an ancestor of the target could never yield a relative path, so it is
+    # dropped with a warning instead of trusted (INV-6: absence of the flag
+    # is the old behaviour).
+    resolved_path_root = ""
+    if path_root:
+        _root = os.path.realpath(os.path.expanduser(path_root))
+        _tgt = os.path.realpath(str(target_path))
+        if os.path.isdir(_root) and (_tgt == _root or _tgt.startswith(_root + os.sep)):
+            resolved_path_root = _root
+        else:
+            print(
+                f"[WARN] --path-root '{path_root}' is not an ancestor directory "
+                "of the target; ignoring it.",
+                file=sys.stderr,
+            )
     # An explicit --scan-mode beats workflow config. Copied rather than mutated in place:
     # `config` is the loaded workflow and is written back out in places, and a CLI flag
     # for one run must not rewrite the operator's file.
@@ -1566,6 +1586,7 @@ async def pipeline(
         snapshot_id=snapshot_id,
         budget_controller=budget_ctrl,
         scan_mode=scan_mode,
+        path_root=resolved_path_root,
     )
 
     print(f"\n🚀 Engaging JSON Graph over target: {target_path} (Run ID: {run_id})...")
@@ -2238,6 +2259,16 @@ def parse_cli_args():
             "described bug, treating file content as untrusted evidence"
         ),
     )
+    parser.add_argument(
+        "--path-root",
+        type=str,
+        default="",
+        help=(
+            "Directory to store finding filepaths relative to (e.g. the "
+            "repository root when scanning a single file inside it); must "
+            "be an ancestor of the target"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -2271,6 +2302,7 @@ if __name__ == "__main__":
                 parallel=args.parallel,
                 focus=args.focus,
                 seed_report_path=args.seed_report,
+                path_root=args.path_root,
             )
         )
         sys.exit(exit_code)

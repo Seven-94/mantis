@@ -283,6 +283,46 @@ class TestADKInvariants(unittest.IsolatedAsyncioTestCase):
         finally:
             current_run_context.reset(token)
 
+    async def test_inv4_single_file_scan_accepts_path_root_spelling(self):
+        """INV-4 x path_root: the repo-relative spelling of the scanned file
+        resolves; every other file stays unreadable.
+
+        Under --path-root the knowledge base stores "sub/handler.py" for a
+        scan of <repo>/sub/handler.py, and downstream stages (reviewer,
+        critic, patcher) re-read the finding by its stored path. That
+        spelling must open the scanned file -- and the rebase must not
+        become a side door to other jail files or repo files outside it.
+        """
+        sub = self.target_dir / "sub"
+        sub.mkdir()
+        (sub / "handler.py").write_text("def handle(): pass", encoding="utf-8")
+        (sub / "other.py").write_text("OTHER_SECRET = 1", encoding="utf-8")
+        single_ctx = RunContext(
+            jail_dir=str(sub),
+            db_path=self.db_path,
+            target_file=str(sub / "handler.py"),
+            run_id="run-single-2",
+            path_root=str(self.target_dir),
+        )
+        token = current_run_context.set(single_ctx)
+        try:
+            allowed = await read_file("sub/handler.py")
+            self.assertIn("def handle(): pass", allowed)
+            # The jail-relative spelling keeps working.
+            allowed_bare = await read_file("handler.py")
+            self.assertIn("def handle(): pass", allowed_bare)
+            # The rebase does not bypass the single-file gate: a sibling
+            # inside the jail, cited repo-relative, is still refused.
+            denied = await read_file("sub/other.py")
+            self.assertIn("Permission denied", denied)
+            self.assertNotIn("OTHER_SECRET", denied)
+            # A repo file OUTSIDE the jail never becomes readable.
+            outside = await read_file("auth.py")
+            self.assertIn("Error", outside)
+            self.assertNotIn("def auth", outside)
+        finally:
+            current_run_context.reset(token)
+
     async def test_inv4_write_file_refuses_host_target_mutation_outside_sandbox(self):
         """INV-4: write_file strictly refuses direct mutation of host target files outside dynamic sandboxes."""
         res = await write_file("main.c", "malicious host mutation")
