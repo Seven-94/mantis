@@ -1597,13 +1597,23 @@ def record_artifact(db_path: str, run_id: str, artifact_type: str, filepath: str
                         parsed["trust_tier"] = metadata["trust_tier"]
                     candidate_resource = metadata.get("resource", "")
                     doc_type = parsed.get("type", "")
+                    repo_doc_types = ("Threat Model", "Architecture Summary", "Threat Boundary")
                     # Attach resource only for file-scoped documents (like Component Entity).
                     # Leave resource empty ("") for repo-wide documents (Threat Model, Architecture Summary).
                     is_file_scoped = (
                         doc_type in ("Component Entity", "Software Entity", "Hardware Entity", "Security Invariant", "Guardrail")
                         or "workspace/kb/entities/" in filepath
                         or artifact_type == "entity"
-                    ) and doc_type not in ("Threat Model", "Architecture Summary", "Threat Boundary")
+                    ) and doc_type not in repo_doc_types
+                    # EXCEPTION: a threat model or architecture summary produced while
+                    # scanning a single FILE describes that file, not the repository.
+                    # Shared databases hold many single-file campaigns, and leaving these
+                    # rows repo-wide leaks one file's threat model into every other
+                    # file's security guidance. Directory/repo campaigns pass a directory
+                    # here and keep resource = "" (genuinely repo-wide); a missing or
+                    # relative path fails safe to the repo-wide behavior.
+                    if doc_type in repo_doc_types and candidate_resource and os.path.isfile(candidate_resource):
+                        is_file_scoped = True
                     if not parsed.get("resource") and candidate_resource and is_file_scoped:
                         parsed["resource"] = canonical_filepath(candidate_resource, target_file=candidate_resource)
                     if not parsed.get("snapshot_id") and metadata.get("snapshot_id"):
@@ -1915,6 +1925,19 @@ def query_security_guidance(db_path: str, filepath: str, run_id: Optional[str] =
         entity_concepts = [c for c in scoped_okf if c.get("type") in ("Component Entity", "Software Entity", "Hardware Entity", "Architecture Summary")]
         invariant_concepts = [c for c in scoped_okf if c.get("type") in ("Security Invariant", "Guardrail")]
         pattern_concepts = [c for c in scoped_okf if c.get("type") in ("Vulnerability Pattern", "Weakness Pattern")]
+
+        # File-scoped concepts outrank repo-wide rows of the same kind. In a shared
+        # database each single-file scan records its own threat model; once this file
+        # has one, inherited repo-wide rows (including legacy rows written before
+        # single-file scans tagged their resource) describe OTHER files and would
+        # mislead. When the file has no scoped concepts, repo-wide rows still apply
+        # in full (fail-safe: stale guidance beats none).
+        if norm_fp:
+            def _prefer_scoped(concepts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+                scoped = [c for c in concepts if (c.get("resource") or "") == norm_fp]
+                return scoped if scoped else concepts
+            threat_concepts = _prefer_scoped(threat_concepts)
+            entity_concepts = _prefer_scoped(entity_concepts)
 
         # Threat model content (compact or full)
         threat_model_content = ""

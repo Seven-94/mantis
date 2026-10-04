@@ -347,5 +347,86 @@ class WorkflowGateTopologyTest(unittest.TestCase):
         self.assertEqual(gate["routes"], ["clean"])
 
 
+class SecurityGuidanceScopingTest(_DbTest):
+    """Threat models from single-file scans must not leak into other files' guidance.
+
+    A shared knowledge.db accumulates one campaign per edited file. Before the
+    fix, every campaign's threat model was stored repo-wide (resource = ""), so
+    `mantis_security_guidance("routes/search.ts")` returned the login.ts threat
+    model. These tests pin the writer (resource tagging) and the reader
+    (file-scoped rows outrank repo-wide ones), plus the repo-wide fail-safe.
+    """
+
+    _TM = "# Threat Model\n\nAuthentication Subsystem (login.ts): credential handling.\n"
+    _TM_SEARCH = "# Threat Model\n\nProduct Search: user-controlled criteria reaches SQL.\n"
+
+    def setUp(self):
+        super().setUp()
+        from core.database import record_artifact  # local: not in module header
+
+        self.record_artifact = record_artifact
+        os.makedirs(os.path.join(self.tmp, "routes"), exist_ok=True)
+        self.login = os.path.join(self.tmp, "routes", "login.ts")
+        self.search = os.path.join(self.tmp, "routes", "search.ts")
+        for p in (self.login, self.search):
+            with open(p, "w", encoding="utf-8") as f:
+                f.write("export {}\n")
+
+    def _record_tm(self, run_id, resource, text):
+        # jail_dir = repo root, as in `--path-root <repo>` scans, so canonical
+        # spellings match what the MCP server queries ("routes/login.ts").
+        self.install_ctx(run_id=run_id)
+        self.record_artifact(
+            self.db, run_id, "threat_model", "workspace/kb/THREAT_MODEL.md",
+            text, metadata={"resource": resource, "agent_authored": True},
+        )
+
+    def _guidance_tm(self, filepath):
+        from core.database import query_security_guidance
+
+        self.install_ctx(run_id="query")
+        return query_security_guidance(self.db, filepath=filepath, full=True)[
+            "guidance_summary"
+        ]
+
+    def test_single_file_scan_tags_threat_model_with_its_file(self):
+        from core.database import read_okf_concepts
+
+        self._record_tm("run-login", self.login, self._TM)
+        rows = [c for c in read_okf_concepts(self.db) if c["type"] == "Threat Model"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["resource"], "routes/login.ts")
+
+    def test_repo_scan_threat_model_stays_repo_wide(self):
+        from core.database import read_okf_concepts
+
+        self._record_tm("run-repo", self.tmp, self._TM)
+        rows = [c for c in read_okf_concepts(self.db) if c["type"] == "Threat Model"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["resource"], "")
+
+    def test_other_files_guidance_does_not_inherit_scoped_threat_model(self):
+        self._record_tm("run-login", self.login, self._TM)
+        self._record_tm("run-search", self.search, self._TM_SEARCH)
+        summary = self._guidance_tm("routes/search.ts")
+        self.assertIn("Product Search", summary)
+        self.assertNotIn("Authentication Subsystem", summary)
+
+    def test_scoped_rows_outrank_legacy_repo_wide_rows(self):
+        # Legacy row: written before the fix, repo-wide despite describing login.
+        self._record_tm("run-legacy", self.tmp, self._TM)
+        self._record_tm("run-search", self.search, self._TM_SEARCH)
+        summary = self._guidance_tm("routes/search.ts")
+        self.assertIn("Product Search", summary)
+        self.assertNotIn("Authentication Subsystem", summary)
+
+    def test_file_without_scoped_rows_still_gets_repo_wide_fallback(self):
+        # Fail-safe: a file nobody scanned yet inherits repo-wide guidance
+        # rather than none at all.
+        self._record_tm("run-legacy", self.tmp, self._TM)
+        summary = self._guidance_tm("routes/search.ts")
+        self.assertIn("Authentication Subsystem", summary)
+
+
 if __name__ == "__main__":
     unittest.main()
