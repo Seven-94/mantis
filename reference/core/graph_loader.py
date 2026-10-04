@@ -246,21 +246,17 @@ def _persist_finding_dismissals(node_id: str, entries: list[dict]) -> None:
     of per campaign: statuses are lowercase, verdicts whose reason begins
     with "Fallback:" are routed but NEVER persisted (route it, never learn
     it), persistence is best-effort (a DB hiccup must not kill the
-    campaign), and update_status's monotonic guard -- not this code -- keeps
-    dismissals from ever overwriting dynamic proof.
+    campaign), and the monotonic guard in the database layer -- not this
+    code -- keeps dismissals from ever overwriting dynamic proof.
 
-    core.database.update_status addresses findings by FILEPATH, not by id,
-    so a dismissal stamp lands on every active finding recorded at that
-    path. Two guards keep that honest:
-
-      * a filepath that also hosts a finding PROMOTED in this same verdict
-        set is never stamped -- the stamp would erase the promotion the
-        reviewer just made; and
-      * a filepath is stamped only when every still-active finding at it is
-        covered by a dismissal entry, so a sibling the reviewer never ruled
-        on cannot be dismissed by mere proximity. Uncovered findings stay
-        `reported`, which is precisely the pre-P6 behaviour for ALL
-        findings, so the guard can only reduce over-recording, never add it.
+    Stamps address the finding ID, not the filepath. A filepath stamp lands
+    on every finding at that path, which forced two guards (skip paths with
+    a promoted sibling, skip paths with an unreviewed sibling) and still
+    left the skipped finding `reported` -- where a later filepath-wide
+    static_confirmed stamp from the reproducer would promote it right past
+    the reviewer's dismissal. Addressing the row directly needs no guards:
+    the stamp judges exactly the claim the reviewer judged, and the terminal
+    status it sets protects the row from later promotion stamps.
     """
     dismissals = [
         e for e in entries
@@ -274,49 +270,15 @@ def _persist_finding_dismissals(node_id: str, entries: list[dict]) -> None:
         rc = current_run_context.get()
         if rc is None or not rc.db_path or not rc.run_id:
             return
-        from core.database import read_findings, update_status
+        from core.database import update_finding_status_by_id
 
-        # Findings whose status is already in this set cannot be altered by
-        # a dismissal stamp (update_status's terminal clauses refuse), so
-        # they do not count as "active" when deciding whether a filepath is
-        # fully covered by the reviewer's dismissals.
-        protected = {
-            "false_positive", "non_viable", "duplicate_merged",
-            "sample_or_test", "mitigated", "dynamic_confirmed",
-            "patch_verified",
-        }
-        fp_by_id: dict[int, str] = {}
-        active_ids_by_fp: dict[str, set] = {}
-        for f in read_findings(rc.db_path, run_id=rc.run_id):
-            try:
-                f_id = int(f.get("id"))
-            except (TypeError, ValueError):
-                continue
-            fp = str(f.get("filepath") or "")
-            fp_by_id[f_id] = fp
-            if str(f.get("status") or "").lower() not in protected:
-                active_ids_by_fp.setdefault(fp, set()).add(f_id)
-
-        promoted_fps = {
-            fp_by_id[e["finding_id"]]
-            for e in entries
-            if e["route"] not in _DISMISSAL_ROUTES and e["finding_id"] in fp_by_id
-        }
-        dismissed_ids = {e["finding_id"] for e in dismissals if e["finding_id"] is not None}
-
-        stamped_fps: set = set()
         for e in dismissals:
-            fp = fp_by_id.get(e["finding_id"], "") if e["finding_id"] is not None else ""
-            if not fp or fp in promoted_fps or fp in stamped_fps:
+            if e["finding_id"] is None:
                 continue
-            if active_ids_by_fp.get(fp, set()) - dismissed_ids:
-                # An active sibling at this path carries no verdict of its
-                # own; stamping the path would judge a finding nobody
-                # reviewed.
-                continue
-            stamped_fps.add(fp)
             try:
-                update_status(rc.db_path, fp, rc.run_id, e["route"])
+                update_finding_status_by_id(
+                    rc.db_path, e["finding_id"], rc.run_id, e["route"]
+                )
             except Exception as exc:
                 print(
                     f"[{node_id}] could not persist '{e['route']}' for finding {e['finding_id']}: {exc}",
@@ -468,6 +430,51 @@ def create_classifier(node_id: str, routes: list[str], max_visits: int = 1):
         return adk.Event(output=node_input, state={state_key: visits}, route=DEFAULT_ROUTE)
 
     return node(_classify, name=node_id)
+
+
+def campaign_has_findings_to_triage(db_path: str, run_id: str, target_file: str):
+    """True if the current campaign recorded any finding still worth triaging.
+
+    Returns None when the question cannot be answered (missing or unreadable
+    database). Callers must treat None as "run the full pipeline": an error
+    may never skip stages.
+    """
+    from core.database import read_findings, FALSE_POSITIVE_STATUSES
+
+    if not db_path or not os.path.exists(db_path):
+        return None
+    try:
+        rows = read_findings(db_path, run_id=run_id, scope_path=target_file or None)
+    except Exception:
+        return None
+    inactive = set(FALSE_POSITIVE_STATUSES) | {"duplicate_merged"}
+    return any(str(r.get("status") or "").lower() not in inactive for r in rows)
+
+
+def create_findings_gate(node_id: str):
+    """Deterministic zero-findings short-circuit after the researcher.
+
+    Most campaigns in a file-by-file sweep are clean, yet the graph still
+    walked deduplicator -> reviewer -> calibrator -> reflector for them.
+    This gate reads the campaign's findings and routes "clean" (straight to
+    the reporter) only when the researcher recorded nothing worth triaging.
+    Everything else -- findings present, no database, a read error -- falls
+    through to the default route and the full pipeline runs as before.
+    """
+    async def _gate(ctx: Context, node_input: Any = None):
+        from core.context import current_run_context
+
+        rc = current_run_context.get()
+        db_path = (getattr(rc, "db_path", None) or ctx.state.get("db_path") or "")
+        run_id = (getattr(rc, "run_id", None) or ctx.state.get("run_id") or "")
+        target_file = (getattr(rc, "target_file", None) or "")
+
+        if campaign_has_findings_to_triage(db_path, run_id, target_file) is False:
+            print(f"[{node_id}] Zero findings recorded for this campaign; skipping triage stages.", flush=True)
+            return adk.Event(output="No findings recorded for this campaign.", route="clean")
+        return adk.Event(output=node_input, route=DEFAULT_ROUTE)
+
+    return node(_gate, name=node_id)
 
 
 def _parse_finding_calibration(
@@ -633,9 +640,12 @@ def create_calibrator_node(
         findings = []
         if db_path and os.path.exists(db_path):
             try:
-                findings = read_findings(db_path, run_id=run_id)
+                # Campaign scope, not run scope: multi-target runs share one
+                # run_id, and an unscoped read re-calibrated every earlier
+                # campaign's findings on each later campaign.
+                findings = read_findings(db_path, run_id=run_id, scope_path=target_file or None)
                 if not findings and not run_id:
-                    findings = read_findings(db_path)
+                    findings = read_findings(db_path, scope_path=target_file or None)
             except Exception:
                 findings = []
 
@@ -995,7 +1005,12 @@ def load_workflow_from_json(
         if isinstance(node_cfg, ClassifierNode):
             if len(node_cfg.routes) != len(set(node_cfg.routes)):
                 errors.append(f"Classifier '{node_id}' routes contain duplicates: {node_cfg.routes}.")
-            nodes[node_id] = create_classifier(node_id, node_cfg.routes, max_visits=node_cfg.max_visits)
+            if node_id == "findings_gate":
+                # Deterministic DB-backed gate, not a verdict parser; same
+                # interception-by-id pattern as the calibrator node.
+                nodes[node_id] = create_findings_gate(node_id)
+            else:
+                nodes[node_id] = create_classifier(node_id, node_cfg.routes, max_visits=node_cfg.max_visits)
             allowed_routes = set(node_cfg.routes) | {DEFAULT_ROUTE}
             if node_cfg.max_visits > 1:
                 allowed_routes.add("exceeded")

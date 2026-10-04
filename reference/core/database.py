@@ -832,6 +832,26 @@ def update_finding_calibration(
             WHERE id = ? AND (run_id = ? OR run_id = '')
         """, (mantis_risk_score, impact_score, likelihood_score, priority, finding_id, run_id))
 
+def _terminal_clause_for(status: str) -> str:
+    """SQL guard keeping status transitions monotonic.
+
+    Returns the WHERE fragment that stops `status` from overwriting a
+    higher-assurance or terminal status. Shared by update_status and
+    update_finding_status_by_id so the two can never drift apart.
+    """
+    if status in ("reported", "static_confirmed"):
+        return "AND LOWER(status) NOT IN ('duplicate_merged', 'false_positive', 'non_viable', 'sample_or_test', 'mitigated', 'dynamic_confirmed', 'patch_verified')"
+    if status in ("dynamic_confirmed", "patch_verified"):
+        return "AND LOWER(status) NOT IN ('duplicate_merged', 'mitigated', 'patch_verified')"
+    if status in ("false_positive", "non_viable", "sample_or_test"):
+        # A dismissal is an OPINION. It never overwrites machine-verified
+        # evidence: INV-5 pins that dynamic proof supersedes a false_positive
+        # verdict, and the reverse direction would let one bad review erase
+        # a reproduced vulnerability.
+        return "AND LOWER(status) NOT IN ('duplicate_merged', 'mitigated', 'dynamic_confirmed', 'patch_verified', 'false_positive', 'non_viable', 'sample_or_test')"
+    return "AND LOWER(status) NOT IN ('duplicate_merged', 'false_positive', 'non_viable', 'sample_or_test', 'mitigated')"
+
+
 def update_status(db_path: str, filepath: str, run_id: str, status: str):
     """Update status for active candidate findings under `filepath` in a given run
     (preserving terminal/suppressed statuses and preventing downgrades).
@@ -854,19 +874,7 @@ def update_status(db_path: str, filepath: str, run_id: str, status: str):
     with _db(db_path) as conn:
         cursor = conn.cursor()
         norm_fp = canonical_filepath(filepath, target_file=filepath)
-        # Monotonic status protection: never overwrite higher-assurance statuses with static_confirmed or reported
-        if status in ("reported", "static_confirmed"):
-            terminal_clause = "AND LOWER(status) NOT IN ('duplicate_merged', 'false_positive', 'non_viable', 'sample_or_test', 'mitigated', 'dynamic_confirmed', 'patch_verified')"
-        elif status in ("dynamic_confirmed", "patch_verified"):
-            terminal_clause = "AND LOWER(status) NOT IN ('duplicate_merged', 'mitigated', 'patch_verified')"
-        elif status in ("false_positive", "non_viable", "sample_or_test"):
-            # A dismissal is an OPINION. It never overwrites machine-verified
-            # evidence: INV-5 pins that dynamic proof supersedes a false_positive
-            # verdict, and the reverse direction would let one bad review erase
-            # a reproduced vulnerability.
-            terminal_clause = "AND LOWER(status) NOT IN ('duplicate_merged', 'mitigated', 'dynamic_confirmed', 'patch_verified', 'false_positive', 'non_viable', 'sample_or_test')"
-        else:
-            terminal_clause = "AND LOWER(status) NOT IN ('duplicate_merged', 'false_positive', 'non_viable', 'sample_or_test', 'mitigated')"
+        terminal_clause = _terminal_clause_for(status)
 
         if not norm_fp or norm_fp in (".", "/"):
             # Empty CAN be legitimate: canonical_filepath relativizes the tree
@@ -932,13 +940,45 @@ def update_status(db_path: str, filepath: str, run_id: str, status: str):
                 """, (new_tier, json.dumps(ver_list), c_id))
 
 
+def update_finding_status_by_id(db_path: str, finding_id: int, run_id: str, status: str):
+    """Update one finding's status by primary key, with the same monotonic
+    guard as update_status.
+
+    A filepath stamp judges an address; this judges a single claim. Used for
+    per-finding verdicts so a dismissal lands only on the finding the
+    reviewer actually ruled on. Once stamped, the terminal status also
+    protects that row from later filepath-wide promotion stamps.
+    """
+    status = (status or "").strip().lower()
+    try:
+        fid = int(finding_id)
+    except (TypeError, ValueError):
+        return
+    with _db(db_path) as conn:
+        cursor = conn.cursor()
+        terminal_clause = _terminal_clause_for(status)
+        cursor.execute(f"""
+            UPDATE findings
+            SET status = ?
+            WHERE id = ? AND run_id = ?
+              {terminal_clause}
+        """, (status, fid, run_id))
+
+
 def read_findings(
     db_path: str,
     filepath: Optional[str] = None,
     run_id: Optional[str] = None,
     status: Optional[str] = None,
+    scope_path: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """Read findings from the database, optionally filtered by filepath, run_id, or status."""
+    """Read findings from the database, optionally filtered by filepath, run_id, or status.
+
+    `scope_path` restricts results to a campaign's scope: the exact path plus
+    its subtree, using the same rule as update_status. Unlike `filepath` (an
+    exact match on one file), it works for directory slices and never touches
+    the filesystem, so it answers the same regardless of CWD.
+    """
     with _db(db_path) as conn:
         cursor = conn.cursor()
         query = "SELECT * FROM findings WHERE 1=1"
@@ -947,6 +987,30 @@ def read_findings(
             norm_fp = canonical_filepath(filepath, target_file=filepath)
             query += " AND filepath = ?"
             params.append(norm_fp)
+        if scope_path:
+            norm_scope = canonical_filepath(scope_path, target_file=scope_path)
+            if norm_scope and norm_scope not in (".", "/"):
+                base = norm_scope.rstrip("/") or norm_scope
+                escaped = base.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                # A cross-file finding can sit at a filepath outside the
+                # campaign scope while citing in-scope files in code_paths
+                # (a JSON array of "path" / "path:line" strings). Matching
+                # those keeps a slice's own cross-directory findings in
+                # scope; the leading quote anchors each pattern to the start
+                # of a JSON string so "app/" cannot match "application/".
+                query += (
+                    " AND (filepath = ? OR filepath LIKE ? ESCAPE '\\'"
+                    " OR code_paths LIKE ? ESCAPE '\\'"
+                    " OR code_paths LIKE ? ESCAPE '\\'"
+                    " OR code_paths LIKE ? ESCAPE '\\')"
+                )
+                params.extend([
+                    base,
+                    escaped + "/%",
+                    '%"' + escaped + '"%',
+                    '%"' + escaped + '/%',
+                    '%"' + escaped + ':%',
+                ])
         if run_id:
             query += " AND run_id = ?"
             params.append(run_id)

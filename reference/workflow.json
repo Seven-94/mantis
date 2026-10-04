@@ -60,6 +60,11 @@
       "tools": ["read_file", "write_file", "list_files", "get_summary", "get_threat_model", "get_plan", "report_findings", "get_findings"]
     },
     {
+      "id": "findings_gate",
+      "type": "classifier",
+      "routes": ["clean"]
+    },
+    {
       "id": "deduplicator",
       "type": "agent",
       "model": "vertex_ai/gemini-3.5-flash-lite",
@@ -146,7 +151,9 @@
     {"from": "architect", "to": "threat_modeler"},
     {"from": "threat_modeler", "to": "planner"},
     {"from": "planner", "to": "researcher"},
-    {"from": "researcher", "to": "deduplicator"},
+    {"from": "researcher", "to": "findings_gate"},
+    {"from": "findings_gate", "to": "deduplicator", "on": "__DEFAULT__"},
+    {"from": "findings_gate", "to": "reporter", "on": "clean"},
     {"from": "deduplicator", "to": "reviewer"},
     {"from": "reviewer", "to": "reviewer_classifier"},
     {"from": "reviewer_classifier", "to": "critic", "on": "confirmed"},

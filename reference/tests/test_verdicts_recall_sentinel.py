@@ -397,11 +397,12 @@ class TestClassifierPerFindingVerdicts(unittest.TestCase):
 
     # -------------------------------------------------- 5: same-filepath guards
 
-    def test_split_verdicts_at_same_filepath_stamp_nothing(self):
-        """update_status addresses findings by FILEPATH: a stamp for the
-        dismissed finding would also hit the promoted finding at the same
-        path, erasing the promotion the reviewer just made. The conservative
-        guard must refuse the stamp entirely."""
+    def test_split_verdicts_at_same_filepath_stamp_only_the_dismissed_id(self):
+        """Dismissals address the finding id, not the filepath, so a
+        dismissal at a path that also hosts a promoted finding stamps
+        exactly the dismissed row. The promotion is untouched, and the
+        dismissed row's terminal status protects it from being laundered
+        into static_confirmed by a later filepath-wide stamp."""
         id_a = _seed_finding(self.db, "x.py")
         id_b = _seed_finding(self.db, "x.py")
 
@@ -414,17 +415,26 @@ class TestClassifierPerFindingVerdicts(unittest.TestCase):
             ],
         })
 
-        statuses = set(_all_statuses(self.db).values())
-        self.assertEqual(statuses, {"reported"},
-                         "A filepath hosting a promoted finding was stamped: "
-                         "the dismissal laundered away a promotion.")
+        conn = sqlite3.connect(self.db)
+        try:
+            rows = dict(conn.execute(
+                "SELECT id, status FROM findings WHERE filepath = 'x.py'"
+            ).fetchall())
+        finally:
+            conn.close()
+        self.assertEqual(rows[id_a], "reported",
+                         "The promoted finding must never be touched by a "
+                         "sibling's dismissal.")
+        self.assertEqual(rows[id_b], "false_positive",
+                         "The dismissed finding must be stamped even when a "
+                         "promoted sibling shares its path.")
 
-    def test_uncovered_active_sibling_at_same_filepath_blocks_the_stamp(self):
+    def test_unreviewed_sibling_at_same_filepath_is_never_stamped(self):
         """A sibling the reviewer never ruled on cannot be dismissed by mere
-        proximity: the filepath is stamped only when ALL its still-active
-        findings are covered by dismissal entries."""
+        proximity: the stamp lands on the reviewed finding's id and nowhere
+        else."""
         id_a = _seed_finding(self.db, "y.py")
-        _seed_finding(self.db, "y.py")  # active sibling with NO verdict
+        id_b = _seed_finding(self.db, "y.py")  # active sibling with NO verdict
 
         self._run_classifier({
             "route": "false_positive",
@@ -434,13 +444,21 @@ class TestClassifierPerFindingVerdicts(unittest.TestCase):
             ],
         })
 
-        statuses = set(_all_statuses(self.db).values())
-        self.assertEqual(statuses, {"reported"},
-                         "An unreviewed sibling was dismissed by proximity.")
+        conn = sqlite3.connect(self.db)
+        try:
+            rows = dict(conn.execute(
+                "SELECT id, status FROM findings WHERE filepath = 'y.py'"
+            ).fetchall())
+        finally:
+            conn.close()
+        self.assertEqual(rows[id_a], "false_positive",
+                         "The reviewed finding must be stamped.")
+        self.assertEqual(rows[id_b], "reported",
+                         "An unreviewed sibling must stay untouched.")
 
     def test_fully_covered_filepath_is_stamped(self):
-        """Positive control for the coverage guard: when every active finding
-        at the path carries a dismissal entry, the stamp fires."""
+        """When every finding at the path carries a dismissal entry, every
+        row is stamped -- one stamp per reviewed finding id."""
         id_a = _seed_finding(self.db, "z.py")
         id_b = _seed_finding(self.db, "z.py")
 

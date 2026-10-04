@@ -261,6 +261,12 @@ def report_findings(report: VulnerabilityReport) -> str:
         return f"ERROR SAVING DB: {e}"
 
 
+# Stages whose job spans the whole run: the reporter writes the run-level
+# packet and the chainer looks for exploit chains across campaigns. Every
+# other stage sees only its own campaign's findings.
+_RUN_WIDE_FINDINGS_NODES = frozenset({"reporter", "chainer"})
+
+
 def get_findings(filepath: str = "") -> str:
     """Retrieves recorded vulnerability findings for the current run context or target file."""
     ctx = current_run_context.get()
@@ -273,7 +279,19 @@ def get_findings(filepath: str = "") -> str:
         clean_fp = filepath.strip().replace("\\", "/").removeprefix("./")
         if clean_fp.endswith("/") or clean_fp in ("workspace/findings", "workspace/findings/", "findings", "workspace", ""):
             clean_fp = ""
-        findings = read_findings(resolved_db, filepath=clean_fp if clean_fp else None, run_id=ctx.run_id)
+        # Default scope is the CAMPAIGN, not the run. In multi-target runs
+        # every campaign shares one run_id, so an unscoped read returned other
+        # campaigns' findings -- which downstream stages could not even open
+        # under the single-file jail. Same subtree rule as update_status.
+        scope = None
+        if not clean_fp and getattr(ctx, "active_node", "") not in _RUN_WIDE_FINDINGS_NODES:
+            scope = getattr(ctx, "target_file", "") or None
+        findings = read_findings(
+            resolved_db,
+            filepath=clean_fp if clean_fp else None,
+            run_id=ctx.run_id,
+            scope_path=scope,
+        )
         if not findings:
             target_desc = f" for '{filepath}'" if filepath else ""
             return f"NO_DATA: Zero findings recorded in database{target_desc}."

@@ -429,13 +429,13 @@ SCENARIOS = {
     ],
     'status_revert_terminal_case_blindness': [
         ('core/database.py',
-         'terminal_clause = "AND LOWER(status) NOT IN (\'duplicate_merged\', \'false_positive\', \'non_viable\', \'sample_or_test\', \'mitigated\', \'dynamic_confirmed\', \'patch_verified\')"',
-         'terminal_clause = "AND status NOT IN (\'duplicate_merged\', \'false_positive\', \'non_viable\', \'sample_or_test\', \'mitigated\', \'dynamic_confirmed\', \'patch_verified\')"  # NEUTERED: an UPPERCASE dismissal is silently un-dismissed'),
+         'return "AND LOWER(status) NOT IN (\'duplicate_merged\', \'false_positive\', \'non_viable\', \'sample_or_test\', \'mitigated\', \'dynamic_confirmed\', \'patch_verified\')"',
+         'return "AND status NOT IN (\'duplicate_merged\', \'false_positive\', \'non_viable\', \'sample_or_test\', \'mitigated\', \'dynamic_confirmed\', \'patch_verified\')"  # NEUTERED: an UPPERCASE dismissal is silently un-dismissed'),
     ],
     'status_revert_dismissal_protection': [
         ('core/database.py',
-         '        elif status in ("false_positive", "non_viable", "sample_or_test"):',
-         '        elif False:  # NEUTERED: a review opinion can erase a reproduced vulnerability'),
+         '    if status in ("false_positive", "non_viable", "sample_or_test"):',
+         '    if False:  # NEUTERED: a review opinion can erase a reproduced vulnerability'),
     ],
     'status_revert_fp_learning_fold': [
         ('core/database.py',
@@ -1165,18 +1165,10 @@ SCENARIOS = {
          "            _persist_finding_dismissals(node_id, finding_entries)",
          "            pass  # NEUTERED: per-finding dismissals never persisted"),
     ],
-    "verdict_revert_promoted_path_guard": [
-        ("core/graph_loader.py",
-         "            if not fp or fp in promoted_fps or fp in stamped_fps:\n"
-         "                continue\n"
-         "            if active_ids_by_fp.get(fp, set()) - dismissed_ids:\n"
-         "                # An active sibling at this path carries no verdict of its\n"
-         "                # own; stamping the path would judge a finding nobody\n"
-         "                # reviewed.\n"
-         "                continue",
-         "            if not fp or fp in stamped_fps:"
-         "  # NEUTERED: promoted-path and sibling-coverage guards removed\n"
-         "                continue"),
+    "verdict_revert_by_id_stamp": [
+        ("core/database.py",
+         "            WHERE id = ? AND run_id = ?",
+         "            WHERE (id = ? OR 1=1) AND run_id = ?  -- NEUTERED: a dismissal stamps every finding in the run, not the one reviewed claim"),
     ],
 
     # ---- P4: success-only coverage stamps ----
@@ -1360,6 +1352,7 @@ def run_matrix(only_scenarios=None):
                 "tests.test_budget_planner",
                 "tests.test_verdicts_recall_sentinel",
                 "tests.test_chains_groups",
+                "tests.test_campaign_scoping",
                 "-v",
             ],
             cwd=dst, capture_output=True, text=True, env=matrix_env,
