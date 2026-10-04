@@ -1283,6 +1283,15 @@ def record_okf_concept(db_path: str, run_id: str, concept: Dict[str, Any]):
         title = concept.get("title") or concept_id
         _iso_default = lambda o: o.isoformat() if hasattr(o, "isoformat") else str(o)
         res = canonical_filepath(concept.get("resource") or "", target_file=concept.get("resource") or "") if concept.get("resource") else ""
+        # UNIQUE(run_id, concept_id) cannot be widened to include the resource
+        # without a schema version bump (which forces users to delete their
+        # databases), so per-file concepts qualify their id with the resource
+        # instead: a frontmatter-less THREAT_MODEL.md carries the same default
+        # id for every file in a multi-file sweep, and file 2's INSERT OR
+        # REPLACE would otherwise evict file 1's row. The endswith guard keeps
+        # export/import roundtrips from qualifying twice.
+        if res and not concept_id.endswith(f"@{res}"):
+            concept_id = f"{concept_id}@{res}"
         tags_str = json.dumps(concept.get("tags") or [], default=_iso_default)
         status = concept.get("status") or "stable"
         trust_tier = concept.get("trust_tier") or "unverified"
@@ -1294,7 +1303,13 @@ def record_okf_concept(db_path: str, run_id: str, concept: Dict[str, Any]):
         body = concept.get("body_markdown") or ""
         raw = concept.get("raw_markdown") or ""
 
-        cursor.execute("DELETE FROM okf_concepts WHERE run_id = ? AND concept_id = ?", (run_id, concept_id))
+        # Dedupe scope includes the resource: the qualified id above already
+        # separates files, and the explicit resource clause keeps legacy
+        # unqualified rows for OTHER files safe from this delete too.
+        cursor.execute(
+            "DELETE FROM okf_concepts WHERE run_id = ? AND concept_id = ? AND resource = ?",
+            (run_id, concept_id, res),
+        )
         cursor.execute("""
             INSERT OR REPLACE INTO okf_concepts (
                 run_id, concept_id, type, title, resource, tags, status,
@@ -1947,9 +1962,42 @@ def query_security_guidance(db_path: str, filepath: str, run_id: Optional[str] =
             else:
                 threat_model_content = "\n\n".join(f"### {c.get('title')}\n{_compact_threat_model(c.get('body_markdown', ''))}" for c in threat_concepts)
         else:
-            raw_tm = read_artifact(db_path, artifact_type="threat_model", run_id=run_id) or ""
-            if not raw_tm:
-                raw_tm = read_artifact(db_path, filepath="workspace/kb/THREAT_MODEL.md", run_id=run_id) or ""
+            # The campaign_artifacts fallback predates per-file scoping, so it
+            # must check which target each stored threat model's campaign
+            # scanned (metadata resource). A row whose resource is another
+            # FILE is that file's threat model and is never inherited; rows
+            # with no resource or a directory resource are repo-wide and apply
+            # to any file. Unparseable metadata counts as repo-wide
+            # (fail-safe: stale guidance beats none).
+            raw_tm = ""
+            for where, base_params in (
+                ("artifact_type = ?", ["threat_model"]),
+                ("filepath = ?", ["workspace/kb/THREAT_MODEL.md"]),
+            ):
+                tm_query = f"SELECT content, metadata_json FROM campaign_artifacts WHERE {where}"
+                tm_params = list(base_params)
+                if run_id:
+                    tm_query += " AND run_id = ?"
+                    tm_params.append(run_id)
+                tm_query += " ORDER BY id DESC"
+                for art_row in cursor.execute(tm_query, tm_params).fetchall():
+                    content = art_row["content"] or ""
+                    if not content:
+                        continue
+                    if norm_fp:
+                        try:
+                            art_meta = json.loads(art_row["metadata_json"] or "{}")
+                        except Exception:
+                            art_meta = {}
+                        res_meta = str(art_meta.get("resource") or "").replace("\\", "/")
+                        if res_meta and os.path.isfile(res_meta):
+                            canon_res = canonical_filepath(res_meta, target_file=res_meta)
+                            if canon_res != norm_fp and not res_meta.endswith("/" + norm_fp):
+                                continue  # another file's threat model
+                    raw_tm = content
+                    break
+                if raw_tm:
+                    break
             threat_model_content = raw_tm.strip() if full else _compact_threat_model(raw_tm)
 
         # 2. Confirmed & Active Vulnerabilities (with verified patches)

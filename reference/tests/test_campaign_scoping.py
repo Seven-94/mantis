@@ -427,6 +427,66 @@ class SecurityGuidanceScopingTest(_DbTest):
         summary = self._guidance_tm("routes/search.ts")
         self.assertIn("Authentication Subsystem", summary)
 
+    def test_unscanned_file_does_not_inherit_scoped_artifact_fallback(self):
+        # Only login.ts was ever scanned; its concept row is file-scoped, so
+        # guidance for an unscanned file falls through to the raw
+        # campaign_artifacts fallback -- which must not serve another file's
+        # threat model either.
+        self._record_tm("run-login", self.login, self._TM)
+        summary = self._guidance_tm("routes/unscanned.ts")
+        self.assertNotIn("Authentication Subsystem", summary)
+
+    def test_scanned_file_still_gets_own_artifact_fallback(self):
+        # A non-markdown threat model artifact (e.g. the structured JSON the
+        # record_threat_model tool writes) never produces a concept row, so
+        # the file's own guidance must reach it through the fallback.
+        self.install_ctx(run_id="run-login")
+        self.record_artifact(
+            self.db, "run-login", "threat_model",
+            "workspace/.structured/threat_model.json",
+            "Authentication Subsystem (login.ts): credential handling.",
+            metadata={"resource": self.login, "agent_authored": True},
+        )
+        self.assertIn(
+            "Authentication Subsystem", self._guidance_tm("routes/login.ts"))
+        self.assertNotIn(
+            "Authentication Subsystem", self._guidance_tm("routes/search.ts"))
+
+    def test_unscanned_file_accepts_repo_wide_artifact_fallback(self):
+        self.install_ctx(run_id="run-repo")
+        self.record_artifact(
+            self.db, "run-repo", "threat_model",
+            "workspace/.structured/threat_model.json",
+            "Repo-wide threat perimeter.",
+            metadata={"resource": self.tmp, "agent_authored": True},
+        )
+        self.assertIn(
+            "Repo-wide threat perimeter", self._guidance_tm("routes/search.ts"))
+
+    def test_same_run_sweep_keeps_both_files_threat_models(self):
+        from core.database import read_okf_concepts
+
+        # One main.py sweep shares a run_id across files; the second file's
+        # frontmatter-less THREAT_MODEL.md must not delete the first file's
+        # concept row.
+        self.install_ctx(run_id="sweep")
+        self.record_artifact(
+            self.db, "sweep", "threat_model", "workspace/kb/THREAT_MODEL.md",
+            self._TM, metadata={"resource": self.login, "agent_authored": True},
+        )
+        self.record_artifact(
+            self.db, "sweep", "threat_model", "workspace/kb/THREAT_MODEL.md",
+            self._TM_SEARCH, metadata={"resource": self.search, "agent_authored": True},
+        )
+        rows = [c for c in read_okf_concepts(self.db) if c["type"] == "Threat Model"]
+        self.assertEqual(
+            sorted(r["resource"] for r in rows),
+            ["routes/login.ts", "routes/search.ts"],
+        )
+        self.assertIn("Authentication Subsystem", self._guidance_tm("routes/login.ts"))
+        self.assertNotIn("Product Search", self._guidance_tm("routes/login.ts"))
+        self.assertIn("Product Search", self._guidance_tm("routes/search.ts"))
+
 
 if __name__ == "__main__":
     unittest.main()
