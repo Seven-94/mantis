@@ -1,6 +1,7 @@
 # Exclude local execution workspace and snapshots
 workspace/
 .mantis_snapshots/
+.mantis/
 *.bak-*
 *.bak
 .DS_Store

@@ -64,6 +64,17 @@ to create fewer vulnerabilities. To try it manually you can run the script:
 python3 scripts/advise.py --file path/to/file.py   # query accumulated knowledge
 ```
 
+### Secure Development Loop (MCP Server)
+
+[`scripts/mcp_server.py`](scripts/mcp_server.py) serves Mantis to MCP-capable
+coding agents (Gemini CLI, Claude Code, Cursor) as a live sidecar: a
+deterministic `mantis_check_change` gate that returns PASS/REVIEW/BLOCK for
+every diff from what Mantis already knows, structural navigation tools over the
+tree-sitter catalog, and a background `mantis_scan_change` that runs the full
+audit pipeline over changed files while development continues. The same gate
+runs one-shot in pre-commit hooks and CI via `--check`. See
+[docs/mcp.md](docs/mcp.md).
+
 ## Benchmarks
 
 Benchmarks for the pipeline live in [`evals/`](evals/README.md): a
