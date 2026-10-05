@@ -6,6 +6,7 @@ import posixpath
 import re
 import subprocess
 from typing import Any, Optional, Union
+from pydantic import ValidationError
 from core.schemas import VulnerabilityReport
 from core.database import (
     write_findings,
@@ -918,11 +919,31 @@ def record_threat_model(threat_model: dict) -> str:
         return "Error: No active execution context."
     try:
         tm_obj = ThreatModel.model_validate(threat_model) if isinstance(threat_model, dict) else threat_model
+        if not (tm_obj.threats or tm_obj.threat_actors or tm_obj.trust_boundaries
+                or tm_obj.entry_points or tm_obj.key_risks):
+            return (
+                "ERROR SAVING THREAT MODEL: the submitted model is empty after "
+                "validation — nothing was recorded. Populate threats (and/or "
+                "threat_actors, trust_boundaries, entry_points, key_risks) with "
+                "lists of plain strings and call record_threat_model again."
+            )
         content_json = tm_obj.model_dump_json(indent=2)
         _persist_artifact(ctx, "threat_model", "workspace/.structured/threat_model.json", content_json)
-        return f"SUCCESS: Recorded threat model with {len(tm_obj.threat_actors)} threat actor(s) and {len(tm_obj.trust_boundaries)} boundary(ies)."
+        return (
+            f"SUCCESS: Recorded threat model with {len(tm_obj.threats)} threat(s), "
+            f"{len(tm_obj.threat_actors)} threat actor(s) and "
+            f"{len(tm_obj.trust_boundaries)} boundary(ies)."
+        )
+    except ValidationError as e:
+        fields = sorted({str(err["loc"][0]) for err in e.errors() if err.get("loc")})
+        return (
+            f"ERROR SAVING THREAT MODEL: {e.error_count()} invalid value(s) in "
+            f"field(s) {', '.join(fields)}. Each field must be a list of plain "
+            "strings, e.g. entry_points=[\"HTTP POST /login\"]. Fix only those "
+            "fields and call record_threat_model again."
+        )
     except Exception as e:
-        return f"ERROR SAVING THREAT MODEL: {e}"
+        return f"ERROR SAVING THREAT MODEL: {type(e).__name__}: {e}"
 
 
 def get_threat_model() -> str:

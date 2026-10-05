@@ -277,6 +277,25 @@ class ThreatModel(BaseModel):
     trust_boundaries: List[str] = Field(default_factory=list, description='System boundaries where untrusted input enters')
     entry_points: List[str] = Field(default_factory=list, description='Public or internal endpoints exposed to input')
     key_risks: List[str] = Field(default_factory=list, description='Primary business or security risks identified')
+    threats: List[str] = Field(default_factory=list, description='Structured threat entries (threat_id, title, target_component, attack_vector, impact) flattened to text — the shape the threat_modeler prompt asks for')
+
+    @field_validator("threat_actors", "trust_boundaries", "entry_points",
+                     "key_risks", "threats", mode="before")
+    @classmethod
+    def _coerce_items_to_str(cls, v):
+        """A dict item is richer, not wrong: flatten to 'k: v; …' text."""
+        if isinstance(v, str):
+            return [v]                       # bare string -> singleton list
+        if isinstance(v, list):
+            out = []
+            for item in v:
+                if isinstance(item, dict):
+                    flat = "; ".join(f"{k}: {val}" for k, val in item.items())
+                    out.append(flat or str(item))
+                else:
+                    out.append(item if isinstance(item, str) else str(item))
+            return out
+        return v
 
 class CodebaseSummary(BaseModel):
     """Codebase summary from structural indexing and research."""
