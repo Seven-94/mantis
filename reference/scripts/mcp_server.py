@@ -237,7 +237,7 @@ def get_findings(state: MantisState, filepath: str = "", status: str = "") -> Di
     rel = state.rel(filepath) if filepath else ""
     out = []
     for f in rows:
-        if rel and not _paths_match(str(f.get("filepath") or ""), rel):
+        if rel and not _finding_matches(state, str(f.get("filepath") or ""), rel):
             continue
         if status and str(f.get("status") or "").lower() != status.lower():
             continue
@@ -372,6 +372,26 @@ def _paths_match(a: str, b: str) -> bool:
     return a == b or a.endswith("/" + b) or b.endswith("/" + a)
 
 
+def _finding_matches(state, stored: str, query: str) -> bool:
+    """Strict matching for the gate layer. Findings store canonical
+    root-relative paths, so when `query` names a real file in the repo both
+    sides are canonical and only exact equality is a match — otherwise
+    duplicate basenames cross-match (an edit to foo/util.h gets BLOCKed by
+    findings on bar/util.h; ubiquitous in C/C++ trees). Component-aligned
+    suffix matching (_paths_match) stays as the fallback for absolute,
+    historical, or deleted paths, where exactness is unknowable."""
+    s = str(stored or "").replace("\\", "/").strip("/")
+    q = str(query or "").replace("\\", "/").strip("/")
+    if not s or not q:
+        return False
+    try:
+        if (state.repo / q).is_file():
+            return s == q
+    except OSError:
+        pass
+    return _paths_match(s, q)
+
+
 def _uncovered(state: MantisState, rel_files: List[str]) -> Optional[List[str]]:
     """Changed files no recorded campaign ever covered, else None if unknowable.
 
@@ -490,8 +510,8 @@ def check_change(state: MantisState, files: Optional[List[str]] = None,
             if str(f.get("status") or "").lower() not in OPEN_FINDING_STATUSES:
                 continue
             f_fp = str(f.get("filepath") or "")
-            direct = any(_paths_match(f_fp, c) for c in changed)
-            in_radius = not direct and any(_paths_match(f_fp, r) for r in radius_files)
+            direct = any(_finding_matches(state, f_fp, c) for c in changed)
+            in_radius = not direct and any(_finding_matches(state, f_fp, r) for r in radius_files)
             if not direct and not in_radius:
                 continue
             view = _finding_view(f)
@@ -643,7 +663,7 @@ def scan_status(state: MantisState, scan_id: str) -> Dict[str, Any]:
         rows = read_findings(state.db_path)
         out["findings_in_scanned_files"] = sum(
             1 for f in rows
-            if any(_paths_match(str(f.get("filepath") or ""), r) for r in record["files"])
+            if any(_finding_matches(state, str(f.get("filepath") or ""), r) for r in record["files"])
         )
     return out
 

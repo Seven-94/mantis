@@ -126,6 +126,47 @@ class TestPathsMatch(unittest.TestCase):
         self.assertFalse(mcp_server._paths_match("", "c.py"))
 
 
+class TestFindingMatches(unittest.TestCase):
+    """Gate-layer matching: exact when the query names a real repo file,
+    suffix fallback only for paths that no longer exist there.
+
+    Duplicate basenames are ubiquitous in C/C++ trees; before the strict
+    rule an edit to foo/util.h was BLOCKed by findings on bar/util.h."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix="mantis_mcp_match_")
+        self.addCleanup(self._tmp.cleanup)
+        repo = Path(self._tmp.name) / "repo"
+        (repo / "foo").mkdir(parents=True)
+        (repo / "bar").mkdir(parents=True)
+        (repo / "foo" / "util.h").write_text("// foo\n", encoding="utf-8")
+        (repo / "bar" / "util.h").write_text("// bar\n", encoding="utf-8")
+        import types
+        self.state = types.SimpleNamespace(repo=repo)
+
+    def test_existing_file_requires_exact_match(self):
+        self.assertTrue(
+            mcp_server._finding_matches(self.state, "foo/util.h", "foo/util.h")
+        )
+        self.assertFalse(
+            mcp_server._finding_matches(self.state, "bar/util.h", "foo/util.h")
+        )
+
+    def test_missing_file_keeps_suffix_fallback(self):
+        # A historical or absolute stored path can't be checked for
+        # exactness; component-aligned suffix matching still applies.
+        self.assertTrue(
+            mcp_server._finding_matches(self.state, "a/b/gone.py", "gone.py")
+        )
+        self.assertFalse(
+            mcp_server._finding_matches(self.state, "a/bgone.py", "gone.py")
+        )
+
+    def test_empty_sides_never_match(self):
+        self.assertFalse(mcp_server._finding_matches(self.state, "", "foo/util.h"))
+        self.assertFalse(mcp_server._finding_matches(self.state, "foo/util.h", ""))
+
+
 class TestGateFailClosed(unittest.TestCase):
     """A gate that cannot see must say REVIEW -- and must not write."""
 
