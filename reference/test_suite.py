@@ -9,6 +9,11 @@ import asyncio
 import subprocess
 import unittest
 from unittest.mock import patch, AsyncMock, MagicMock
+
+from tests import ensure_reference_deps
+
+ensure_reference_deps()
+
 from pydantic import Field
 from google import adk
 from google.genai import types
