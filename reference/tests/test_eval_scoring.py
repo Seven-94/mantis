@@ -1,0 +1,200 @@
+"""Unit tests for eval scoring honesty in run_eval (issue #8).
+
+A model that never answers (dead key, quota, timeout) must not be scored as a
+correct rejector: no-verdict cases get their own bucket and are never TN,
+precision is undefined (None) rather than 1.0 when there are no positive
+predictions, and the calibrator does not invent a 5.0 score for findings that
+were never scored. Operational metrics stay harsh: a real finding that gets no
+verdict is still a fatal drop.
+"""
+
+import sys
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+_REF_ROOT = str(Path(__file__).resolve().parent.parent)
+if _REF_ROOT not in sys.path:
+    sys.path.insert(0, _REF_ROOT)
+
+import json
+
+import evals.run_eval as run_eval
+
+_EVALS_DIR = Path(_REF_ROOT) / "evals"
+_REVIEW_DS = _EVALS_DIR / "review_dataset.json"
+_CRITIC_DS = _EVALS_DIR / "critic_dataset.json"
+_CALIBRATE_DS = _EVALS_DIR / "calibrate_dataset.json"
+
+
+async def _dead_run_async(self, *args, **kwargs):
+    """Simulates a model/API that always fails: raises before any event."""
+    raise RuntimeError("simulated model failure")
+    yield  # pragma: no cover - makes this an async generator function
+
+
+def _event(text):
+    return SimpleNamespace(content=SimpleNamespace(parts=[SimpleNamespace(text=text)]))
+
+
+def _route_oracle(title_to_route, fail_routes=()):
+    """run_async stub answering the ground-truth route per case (by prompt title).
+
+    Routes listed in fail_routes raise instead, simulating a model that only
+    fails on those cases.
+    """
+
+    async def oracle(self, *args, **kwargs):
+        prompt = kwargs["new_message"].parts[0].text
+        route = next(r for t, r in title_to_route.items() if t in prompt)
+        if route in fail_routes:
+            raise RuntimeError("simulated failure on this case")
+        yield _event(f'{{"route": "{route}"}}')
+
+    return oracle
+
+
+def _title_routes(dataset_path):
+    with open(dataset_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return {c["finding"]["title"]: c["ground_truth"]["expected_route"] for c in data["cases"]}
+
+
+class TestEvalScoring(unittest.IsolatedAsyncioTestCase):
+
+    # ------------------------------------------------------------------
+    # Dead model: must be visibly broken, not a perfect filter.
+    # ------------------------------------------------------------------
+
+    async def test_dead_model_reviewer_scores_no_true_negatives(self):
+        with patch.object(run_eval.Runner, "run_async", _dead_run_async):
+            res = await run_eval.eval_reviewer("test-model", "low", _REVIEW_DS)
+        self.assertEqual(res["tp"], 0)
+        self.assertEqual(res["fp"], 0)
+        self.assertEqual(res["tn"], 0)
+        self.assertEqual(res["fn"], 0)
+        self.assertEqual(res["no_verdict"], 6)
+        self.assertEqual(res["errors"], 6)
+        self.assertIsNone(res["precision"])
+        self.assertEqual(res["recall"], 0.0)
+        self.assertEqual(res["noise_admitted"], 0)
+        # Operationally the two real findings were still dropped.
+        self.assertEqual(res["fatal_drops"], 2)
+        self.assertAlmostEqual(res["safety"], 4 / 6)
+
+    async def test_dead_model_critic_scores_no_true_negatives(self):
+        with patch.object(run_eval.Runner, "run_async", _dead_run_async):
+            res = await run_eval.eval_critic("test-model", "low", _CRITIC_DS)
+        self.assertEqual(res["tn"], 0)
+        self.assertEqual(res["no_verdict"], 4)
+        self.assertEqual(res["errors"], 4)
+        self.assertIsNone(res["precision"])
+        self.assertEqual(res["recall"], 0.0)
+
+    async def test_dead_model_calibrator_reports_unscored_not_mae(self):
+        with patch.object(run_eval.Runner, "run_async", _dead_run_async):
+            res = await run_eval.eval_calibrator("test-model", "low", _CALIBRATE_DS)
+        self.assertIsNone(res["mae"])
+        self.assertEqual(res["unscored"], 3)
+        self.assertEqual(res["errors"], 1)
+        self.assertEqual(res["priority_accuracy"], 0.0)
+
+    # ------------------------------------------------------------------
+    # Partially dead model: silence on positives is fatal, not neutral.
+    # ------------------------------------------------------------------
+
+    async def test_reviewer_silence_on_positives_still_counts_as_fatal_drop(self):
+        routes = _title_routes(_REVIEW_DS)
+        oracle = _route_oracle(routes, fail_routes=("confirmed",))
+        with patch.object(run_eval.Runner, "run_async", oracle):
+            res = await run_eval.eval_reviewer("test-model", "low", _REVIEW_DS)
+        self.assertEqual(res["tn"], 4)
+        self.assertEqual(res["no_verdict"], 2)
+        self.assertEqual(res["errors"], 2)
+        # No positive predictions were made, so precision is undefined --
+        # not 1.0 -- even though the negatives were all handled correctly.
+        self.assertIsNone(res["precision"])
+        self.assertEqual(res["recall"], 0.0)
+        self.assertEqual(res["fatal_drops"], 2)
+        self.assertAlmostEqual(res["safety"], 4 / 6)
+
+    # ------------------------------------------------------------------
+    # Healthy and noisy models: real verdicts still score normally.
+    # ------------------------------------------------------------------
+
+    async def test_reviewer_perfect_model_scores_perfectly(self):
+        routes = _title_routes(_REVIEW_DS)
+        with patch.object(run_eval.Runner, "run_async", _route_oracle(routes)):
+            res = await run_eval.eval_reviewer("test-model", "low", _REVIEW_DS)
+        self.assertEqual(res["tp"], 2)
+        self.assertEqual(res["tn"], 4)
+        self.assertEqual(res["no_verdict"], 0)
+        self.assertEqual(res["errors"], 0)
+        self.assertEqual(res["precision"], 1.0)
+        self.assertEqual(res["recall"], 1.0)
+        self.assertEqual(res["fatal_drops"], 0)
+        self.assertEqual(res["safety"], 1.0)
+
+    async def test_reviewer_confirm_everything_model_pays_in_precision(self):
+        routes = _title_routes(_REVIEW_DS)
+        all_confirmed = {t: "confirmed" for t in routes}
+        with patch.object(run_eval.Runner, "run_async", _route_oracle(all_confirmed)):
+            res = await run_eval.eval_reviewer("test-model", "low", _REVIEW_DS)
+        self.assertEqual(res["tp"], 2)
+        self.assertEqual(res["fp"], 4)
+        self.assertEqual(res["tn"], 0)
+        self.assertEqual(res["no_verdict"], 0)
+        self.assertAlmostEqual(res["precision"], 2 / 6)
+        self.assertEqual(res["noise_admitted"], 4)
+
+    # ------------------------------------------------------------------
+    # score_dedup_partition: undefined precision without merge evidence.
+    # ------------------------------------------------------------------
+
+    def test_dedup_precision_undefined_when_nothing_merged(self):
+        gt = {
+            "findings": [
+                {"id": 1, "title": "A"},
+                {"id": 2, "title": "A-dup"},
+                {"id": 3, "title": "B"},
+            ],
+            "ground_truth_clusters": {
+                "c1": {"finding_ids": [1, 2], "relation": "DUPLICATE"},
+                "c2": {"finding_ids": [3], "relation": "DISTINCT"},
+            },
+        }
+        res = run_eval.score_dedup_partition([], gt)
+        self.assertEqual(res["tp"], 0)
+        self.assertEqual(res["fn"], 1)
+        self.assertEqual(res["tn"], 1)
+        self.assertIsNone(res["precision"])
+        self.assertIsNone(res["f1"])
+        self.assertEqual(res["recall"], 0.0)
+
+    def test_dedup_real_merge_still_scores_defined_precision(self):
+        gt = {
+            "findings": [
+                {"id": 1, "title": "A"},
+                {"id": 2, "title": "A-dup"},
+                {"id": 3, "title": "B"},
+            ],
+            "ground_truth_clusters": {
+                "c1": {"finding_ids": [1, 2], "relation": "DUPLICATE"},
+                "c2": {"finding_ids": [3], "relation": "DISTINCT"},
+            },
+        }
+        db = [
+            {"title": "A", "status": "active"},
+            {"title": "A-dup", "status": "duplicate_merged"},
+            {"title": "B", "status": "active"},
+        ]
+        res = run_eval.score_dedup_partition(db, gt)
+        self.assertEqual(res["tp"], 1)
+        self.assertEqual(res["precision"], 1.0)
+        self.assertEqual(res["recall"], 1.0)
+        self.assertEqual(res["f1"], 1.0)
+
+
+if __name__ == "__main__":
+    unittest.main()

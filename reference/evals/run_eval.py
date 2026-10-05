@@ -62,9 +62,15 @@ def score_dedup_partition(db_findings: List[Dict[str, Any]], ground_truth: Dict[
                 false_merges.append(cname)
             else:
                 tn += 1
-    precision = tp / (tp + fp) if (tp + fp) > 0 else (1.0 if fp == 0 else 0.0)
+    # tp + fp == 0 means the stage never merged anything: there is no evidence
+    # about merge precision either way, so report it as undefined rather than
+    # perfect -- a dead model must not outscore a working one (issue #8).
+    precision = tp / (tp + fp) if (tp + fp) > 0 else None
     recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
+    if precision is None:
+        f1 = None
+    else:
+        f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
     safety = tn / (tn + fp) if (tn + fp) > 0 else 1.0
     return {"tp": tp, "fn": fn, "fp": fp, "tn": tn, "precision": precision, "recall": recall, "f1": f1, "safety": safety, "false_merges": false_merges, "missed_merges": missed_merges}
 
@@ -103,13 +109,16 @@ async def eval_reviewer(model_id: str, effort: str, dataset_path: Path) -> Dict[
     agent = build_stage_agent("reviewer", model_id=model_id, reasoning_effort=effort)
     session_service = InMemorySessionService()
     runner = Runner(agent=agent, session_service=session_service, app_name="eval_app")
-    tp = 0; fp = 0; tn = 0; fn = 0; t0 = time.time()
+    tp = 0; fp = 0; tn = 0; fn = 0; no_verdict = 0; errors = 0; t0 = time.time()
     for case in rdata["cases"]:
         session = await session_service.create_session(app_name="eval_app", user_id="eval_user")
         finding = case["finding"]; exp_route = case["ground_truth"]["expected_route"]
         prompt = f"Review finding: Title: {finding['title']} at {finding['filepath']}. Description: {finding['description']}. Output a ReviewVerdict with route='confirmed' or route='false_positive'."
         content = types.Content(role="user", parts=[types.Part.from_text(text=prompt)])
-        last_route = "false_positive"
+        # None until a verdict is actually parsed: a case where the model never
+        # answers, or the call fails, must not inherit the negative class and
+        # score as a correct rejection (issue #8).
+        last_route = None
         try:
             async for event in runner.run_async(session_id=session.id, user_id="eval_user", new_message=content):
                 if hasattr(event, "content") and event.content:
@@ -120,20 +129,30 @@ async def eval_reviewer(model_id: str, effort: str, dataset_path: Path) -> Dict[
                                 last_route = "confirmed"
                             elif '"route": "false_positive"' in txt or "'route': 'false_positive'" in txt or "route: false_positive" in txt:
                                 last_route = "false_positive"
-        except Exception: pass
-        if exp_route == "confirmed":
+        except Exception:
+            errors += 1
+        if last_route is None:
+            no_verdict += 1
+        elif exp_route == "confirmed":
             if last_route == "confirmed": tp += 1
             else: fn += 1
         else:
             if last_route == "false_positive": tn += 1
             else: fp += 1
     latency = time.time() - t0
-    precision = tp / (tp + fp) if (tp + fp) > 0 else (1.0 if fp == 0 else 0.0)
-    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    safety = (len(rdata["cases"]) - fn) / len(rdata["cases"]) if len(rdata["cases"]) > 0 else 1.0
+    total_cases = len(rdata["cases"])
+    total_pos = sum(1 for c in rdata["cases"] if c["ground_truth"]["expected_route"] == "confirmed")
+    # Classifier metrics are computed over parsed verdicts only; precision is
+    # undefined (not perfect) when the model never made a positive prediction.
+    precision = tp / (tp + fp) if (tp + fp) > 0 else None
+    # Operational metrics keep counting silence: a real finding with no verdict
+    # is still a dropped finding, exactly like an explicit dismissal.
+    recall = tp / total_pos if total_pos > 0 else 0.0
+    fatal_drops = total_pos - tp
+    safety = (total_cases - fatal_drops) / total_cases if total_cases > 0 else 1.0
     import shutil
     if os.path.exists(temp_dir): shutil.rmtree(temp_dir)
-    return {"tp": tp, "fp": fp, "tn": tn, "fn": fn, "precision": precision, "recall": recall, "safety": safety, "fatal_drops": fn, "noise_admitted": fp, "latency": latency}
+    return {"tp": tp, "fp": fp, "tn": tn, "fn": fn, "no_verdict": no_verdict, "errors": errors, "precision": precision, "recall": recall, "safety": safety, "fatal_drops": fatal_drops, "noise_admitted": fp, "latency": latency}
 
 async def eval_critic(model_id: str, effort: str, dataset_path: Path) -> Dict[str, Any]:
     with open(dataset_path, "r", encoding="utf-8") as f:
@@ -145,13 +164,14 @@ async def eval_critic(model_id: str, effort: str, dataset_path: Path) -> Dict[st
     agent = build_stage_agent("critic", model_id=model_id, reasoning_effort=effort)
     session_service = InMemorySessionService()
     runner = Runner(agent=agent, session_service=session_service, app_name="eval_app")
-    tp = 0; fp = 0; tn = 0; fn = 0; t0 = time.time()
+    tp = 0; fp = 0; tn = 0; fn = 0; no_verdict = 0; errors = 0; t0 = time.time()
     for case in cdata["cases"]:
         session = await session_service.create_session(app_name="eval_app", user_id="eval_user")
         finding = case["finding"]; exp_route = case["ground_truth"]["expected_route"]
         prompt = f"Assess exploit viability: Title: {finding['title']} at {finding['filepath']}. Description: {finding['description']}. Output a CriticVerdict with route='viable' or route='non_viable'."
         content = types.Content(role="user", parts=[types.Part.from_text(text=prompt)])
-        last_route = "non_viable"
+        # None until a verdict is actually parsed; see eval_reviewer (issue #8).
+        last_route = None
         try:
             async for event in runner.run_async(session_id=session.id, user_id="eval_user", new_message=content):
                 if hasattr(event, "content") and event.content:
@@ -162,19 +182,23 @@ async def eval_critic(model_id: str, effort: str, dataset_path: Path) -> Dict[st
                                 last_route = "viable"
                             elif '"route": "non_viable"' in txt or "'route': 'non_viable'" in txt or "route: non_viable" in txt:
                                 last_route = "non_viable"
-        except Exception: pass
-        if exp_route == "viable":
+        except Exception:
+            errors += 1
+        if last_route is None:
+            no_verdict += 1
+        elif exp_route == "viable":
             if last_route == "viable": tp += 1
             else: fn += 1
         else:
             if last_route == "non_viable": tn += 1
             else: fp += 1
     latency = time.time() - t0
-    precision = tp / (tp + fp) if (tp + fp) > 0 else (1.0 if fp == 0 else 0.0)
-    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    total_pos = sum(1 for c in cdata["cases"] if c["ground_truth"]["expected_route"] == "viable")
+    precision = tp / (tp + fp) if (tp + fp) > 0 else None
+    recall = tp / total_pos if total_pos > 0 else 0.0
     import shutil
     if os.path.exists(temp_dir): shutil.rmtree(temp_dir)
-    return {"tp": tp, "fp": fp, "tn": tn, "fn": fn, "precision": precision, "recall": recall, "latency": latency}
+    return {"tp": tp, "fp": fp, "tn": tn, "fn": fn, "no_verdict": no_verdict, "errors": errors, "precision": precision, "recall": recall, "latency": latency}
 
 async def eval_calibrator(model_id: str, effort: str, dataset_path: Path) -> Dict[str, Any]:
     with open(dataset_path, "r", encoding="utf-8") as f:
@@ -189,36 +213,42 @@ async def eval_calibrator(model_id: str, effort: str, dataset_path: Path) -> Dic
     session = await session_service.create_session(app_name="eval_app", user_id="eval_user")
     prompt = "You are the calibrator stage. 1. Call get_findings() to retrieve findings. 2. Call calibrate_finding(finding_id, mantis_risk_score, impact_score, likelihood_score, priority) for each finding on the 0.1-10.0 scale."
     content = types.Content(role="user", parts=[types.Part.from_text(text=prompt)])
-    t0 = time.time()
+    t0 = time.time(); errors = 0
     try:
         async for _ in runner.run_async(session_id=session.id, user_id="eval_user", new_message=content): pass
-    except Exception: pass
+    except Exception:
+        errors += 1
     latency = time.time() - t0
     findings = read_findings(db_path)
     f_by_title = {f.get("title", ""): f for f in findings}
     correct_priorities = 0
     score_errors = []
+    unscored = 0
     for case in cdata["cases"]:
         f_title = case["finding"].get("title", "")
         f_row = f_by_title.get(f_title, {})
         gt = case["ground_truth"]
         assigned_score = f_row.get("mantis_risk_score")
         if assigned_score is None:
-            assigned_score = 5.0
-        min_s = gt.get("expected_min_score", 1.0)
-        max_s = gt.get("expected_max_score", 10.0)
-        mid_s = (min_s + max_s) / 2.0
-        score_errors.append(abs(assigned_score - mid_s))
+            # No substitute score: a run that scored nothing must not earn an
+            # MAE measured from an invented 5.0 (issue #8). Unscored findings
+            # are excluded from the MAE and reported separately.
+            unscored += 1
+        else:
+            min_s = gt.get("expected_min_score", 1.0)
+            max_s = gt.get("expected_max_score", 10.0)
+            mid_s = (min_s + max_s) / 2.0
+            score_errors.append(abs(assigned_score - mid_s))
         assigned_prio = str(f_row.get("priority") or "").upper()
         expected_prio = str(gt.get("expected_priority", "")).upper()
         if expected_prio and (expected_prio in assigned_prio or any(p in assigned_prio for p in expected_prio.split("_") if p)):
             correct_priorities += 1
-    mae = sum(score_errors) / len(score_errors) if score_errors else 0.0
+    mae = sum(score_errors) / len(score_errors) if score_errors else None
     prio_acc = correct_priorities / len(cdata["cases"]) if cdata["cases"] else 0.0
     import shutil
     if os.path.exists(temp_dir):
         shutil.rmtree(temp_dir)
-    return {"mae": mae, "priority_accuracy": prio_acc, "latency": latency}
+    return {"mae": mae, "priority_accuracy": prio_acc, "unscored": unscored, "errors": errors, "latency": latency}
 
 async def run_stage_benchmark(stage: str, models: List[tuple], runs: int = 1, toolset: str = "baseline"):
     os.environ["VERTEXAI_LOCATION"] = os.environ.get("VERTEXAI_LOCATION", "global")
@@ -262,40 +292,48 @@ async def run_stage_benchmark(stage: str, models: List[tuple], runs: int = 1, to
         avg_lat = sum(latencies) / len(latencies) if latencies else 0.0
         min_lat = min(latencies) if latencies else 0.0; max_lat = max(latencies) if latencies else 0.0
         if stage == "dedupe":
-            precisions = [r.get("precision", 0.0) for r in run_results]
+            # None = undefined (no positive predictions); skipped rather than
+            # averaged so a dead run cannot lift the mean (issue #8).
+            precisions = [p for p in (r.get("precision") for r in run_results) if p is not None]
             recalls = [r.get("recall", 0.0) for r in run_results]
             false_merges = [r.get("fp", 0) for r in run_results]
             max_fp = max(false_merges) if false_merges else 0
-            avg_prec = sum(precisions) / len(precisions) if precisions else 0.0
+            avg_prec_s = f"{(sum(precisions) / len(precisions))*100:.0f}%" if precisions else "n/a"
             avg_rec = sum(recalls) / len(recalls) if recalls else 0.0
             worst_safety = min(r.get("safety", 1.0) for r in run_results) if run_results else 1.0
-            row = {"model": short_name, "effort": effort, "max_false_merges": max_fp, "avg_precision": f"{avg_prec*100:.0f}%", "avg_recall": f"{avg_rec*100:.0f}%", "worst_safety": f"{worst_safety*100:.0f}%", "latency": f"{avg_lat:.2f}s ({min_lat:.1f}s-{max_lat:.1f}s)"}
-            print(f"--> [DEDUPE] Worst FP: {max_fp} | Avg Prec: {avg_prec*100:.0f}% | Avg Rec: {avg_rec*100:.0f}% | Latency: {avg_lat:.2f}s")
+            row = {"model": short_name, "effort": effort, "max_false_merges": max_fp, "avg_precision": avg_prec_s, "avg_recall": f"{avg_rec*100:.0f}%", "worst_safety": f"{worst_safety*100:.0f}%", "latency": f"{avg_lat:.2f}s ({min_lat:.1f}s-{max_lat:.1f}s)"}
+            print(f"--> [DEDUPE] Worst FP: {max_fp} | Avg Prec: {avg_prec_s} | Avg Rec: {avg_rec*100:.0f}% | Latency: {avg_lat:.2f}s")
             summary_rows.append(row)
         elif stage == "review":
             fatal_drops = [r.get("fatal_drops", 0) for r in run_results]
             noise_adm = [r.get("noise_admitted", 0) for r in run_results]
+            no_verdicts = [r.get("no_verdict", 0) for r in run_results]
             max_drops = max(fatal_drops) if fatal_drops else 0
+            max_nv = max(no_verdicts) if no_verdicts else 0
             avg_noise = sum(noise_adm) / len(noise_adm) if noise_adm else 0.0
             worst_safety = min(r.get("safety", 1.0) for r in run_results) if run_results else 1.0
-            row = {"model": short_name, "effort": effort, "max_fatal_drops": max_drops, "avg_noise_admitted": f"{avg_noise:.1f}", "worst_safety": f"{worst_safety*100:.0f}%", "latency": f"{avg_lat:.2f}s ({min_lat:.1f}s-{max_lat:.1f}s)"}
-            print(f"--> [REVIEW] Worst Fatal Drops: {max_drops} | Avg Noise: {avg_noise:.1f} | Latency: {avg_lat:.2f}s")
+            row = {"model": short_name, "effort": effort, "max_fatal_drops": max_drops, "avg_noise_admitted": f"{avg_noise:.1f}", "max_no_verdict": max_nv, "worst_safety": f"{worst_safety*100:.0f}%", "latency": f"{avg_lat:.2f}s ({min_lat:.1f}s-{max_lat:.1f}s)"}
+            print(f"--> [REVIEW] Worst Fatal Drops: {max_drops} | Avg Noise: {avg_noise:.1f} | Max NoVerdict: {max_nv} | Latency: {avg_lat:.2f}s")
             summary_rows.append(row)
         elif stage == "critic":
-            precisions = [r.get("precision", 0.0) for r in run_results]
+            precisions = [p for p in (r.get("precision") for r in run_results) if p is not None]
             recalls = [r.get("recall", 0.0) for r in run_results]
-            avg_prec = sum(precisions) / len(precisions) if precisions else 0.0
+            no_verdicts = [r.get("no_verdict", 0) for r in run_results]
+            max_nv = max(no_verdicts) if no_verdicts else 0
+            avg_prec_s = f"{(sum(precisions) / len(precisions))*100:.0f}%" if precisions else "n/a"
             avg_rec = sum(recalls) / len(recalls) if recalls else 0.0
-            row = {"model": short_name, "effort": effort, "avg_precision": f"{avg_prec*100:.0f}%", "avg_recall": f"{avg_rec*100:.0f}%", "latency": f"{avg_lat:.2f}s ({min_lat:.1f}s-{max_lat:.1f}s)"}
-            print(f"--> [CRITIC] Avg Prec: {avg_prec*100:.0f}% | Avg Rec: {avg_rec*100:.0f}% | Latency: {avg_lat:.2f}s")
+            row = {"model": short_name, "effort": effort, "avg_precision": avg_prec_s, "avg_recall": f"{avg_rec*100:.0f}%", "max_no_verdict": max_nv, "latency": f"{avg_lat:.2f}s ({min_lat:.1f}s-{max_lat:.1f}s)"}
+            print(f"--> [CRITIC] Avg Prec: {avg_prec_s} | Avg Rec: {avg_rec*100:.0f}% | Max NoVerdict: {max_nv} | Latency: {avg_lat:.2f}s")
             summary_rows.append(row)
         elif stage == "calibrate":
-            maes = [r.get("mae", 0.0) for r in run_results]
+            maes = [m for m in (r.get("mae") for r in run_results) if m is not None]
             prio_accs = [r.get("priority_accuracy", 0.0) for r in run_results]
-            avg_mae = sum(maes) / len(maes) if maes else 0.0
+            unscored_counts = [r.get("unscored", 0) for r in run_results]
+            max_unscored = max(unscored_counts) if unscored_counts else 0
+            avg_mae_s = f"{(sum(maes) / len(maes)):.2f}" if maes else "n/a"
             avg_prio = sum(prio_accs) / len(prio_accs) if prio_accs else 0.0
-            row = {"model": short_name, "effort": effort, "avg_mae": f"{avg_mae:.2f}", "prio_acc": f"{avg_prio*100:.0f}%", "latency": f"{avg_lat:.2f}s ({min_lat:.1f}s-{max_lat:.1f}s)"}
-            print(f"--> [CALIBRATE] MAE: {avg_mae:.2f} | Priority Acc: {avg_prio*100:.0f}% | Latency: {avg_lat:.2f}s")
+            row = {"model": short_name, "effort": effort, "avg_mae": avg_mae_s, "prio_acc": f"{avg_prio*100:.0f}%", "max_unscored": max_unscored, "latency": f"{avg_lat:.2f}s ({min_lat:.1f}s-{max_lat:.1f}s)"}
+            print(f"--> [CALIBRATE] MAE: {avg_mae_s} | Priority Acc: {avg_prio*100:.0f}% | Max Unscored: {max_unscored} | Latency: {avg_lat:.2f}s")
             summary_rows.append(row)
         elif stage == "research":
             recalls = [r.get("recall", 0.0) for r in run_results]
@@ -323,20 +361,20 @@ async def run_stage_benchmark(stage: str, models: List[tuple], runs: int = 1, to
         for r in summary_rows:
             print(f"{r['model']:<22} | {r['effort']:<6} | {r['max_false_merges']:<17} | {r['avg_precision']:<9} | {r['avg_recall']:<8} | {r['worst_safety']:<13} | {r['latency']}")
     elif stage == "review":
-        print(f"{'Model':<22} | {'Effort':<6} | {'Max Fatal Drops':<16} | {'Avg Noise Admitted':<19} | {'Worst Safety':<13} | {'Latency Distribution'}")
+        print(f"{'Model':<22} | {'Effort':<6} | {'Max Fatal Drops':<16} | {'Avg Noise Admitted':<19} | {'Max NoVerdict':<13} | {'Worst Safety':<13} | {'Latency Distribution'}")
         print("-" * 110)
         for r in summary_rows:
-            print(f"{r['model']:<22} | {r['effort']:<6} | {r['max_fatal_drops']:<16} | {r['avg_noise_admitted']:<19} | {r['worst_safety']:<13} | {r['latency']}")
+            print(f"{r['model']:<22} | {r['effort']:<6} | {r['max_fatal_drops']:<16} | {r['avg_noise_admitted']:<19} | {r['max_no_verdict']:<13} | {r['worst_safety']:<13} | {r['latency']}")
     elif stage == "critic":
-        print(f"{'Model':<22} | {'Effort':<6} | {'Avg Precision':<15} | {'Avg Recall':<12} | {'Latency Distribution'}")
+        print(f"{'Model':<22} | {'Effort':<6} | {'Avg Precision':<15} | {'Avg Recall':<12} | {'Max NoVerdict':<13} | {'Latency Distribution'}")
         print("-" * 110)
         for r in summary_rows:
-            print(f"{r['model']:<22} | {r['effort']:<6} | {r['avg_precision']:<15} | {r['avg_recall']:<12} | {r['latency']}")
+            print(f"{r['model']:<22} | {r['effort']:<6} | {r['avg_precision']:<15} | {r['avg_recall']:<12} | {r['max_no_verdict']:<13} | {r['latency']}")
     elif stage == "calibrate":
-        print(f"{'Model':<22} | {'Effort':<6} | {'Risk Score MAE':<15} | {'Priority Acc':<13} | {'Latency Distribution'}")
+        print(f"{'Model':<22} | {'Effort':<6} | {'Risk Score MAE':<15} | {'Priority Acc':<13} | {'Max Unscored':<13} | {'Latency Distribution'}")
         print("-" * 110)
         for r in summary_rows:
-            print(f"{r['model']:<22} | {r['effort']:<6} | {r['avg_mae']:<15} | {r['prio_acc']:<13} | {r['latency']}")
+            print(f"{r['model']:<22} | {r['effort']:<6} | {r['avg_mae']:<15} | {r['prio_acc']:<13} | {r['max_unscored']:<13} | {r['latency']}")
     elif stage == "research":
         print(f"{'Model':<22} | {'Effort':<6} | {'Avg Rec':<8} | {'Worst Rec':<10} | {'XFile Rec':<10} | {'Avg Prec':<9} | {'Tok/Detected':<13} | {'Latency Distribution'}")
         print("-" * 110)
