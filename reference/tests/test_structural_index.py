@@ -28,7 +28,10 @@ from core.context import RunContext, current_run_context
 from core.structural_index import (
     MAX_FILE_BYTES,
     StructuralIndex,
+    _language_for,
+    _load_parser,
     build_structural_index,
+    extract_unit,
     state_dir_for_db,
 )
 
@@ -588,6 +591,223 @@ class MacroIndexingTest(unittest.TestCase):
         res = idx.get_function_boundary("src/port.c", 2)
         self.assertTrue(res["found"])
         self.assertEqual(res["qualified_name"], "get_port")
+
+
+class LanguageCoverageTest(unittest.TestCase):
+    """Definition kinds across all supported grammars.
+
+    Each case pins constructs that used to be invisible (Go types, C/C++
+    type specifiers, Rust items, Kotlin functions/objects, TS/JS named
+    function values, Java/C#/PHP/Ruby type declarations) AND the gates
+    that keep the new mappings from minting fake symbols: C/C++ forward
+    declarations, Kotlin/Java/C# variable declarations, and python's
+    literal "module" root node.
+    """
+
+    def _syms(self, fname: str, src: str) -> dict:
+        lang = _language_for(fname)
+        parser = _load_parser(lang)
+        if parser is None:
+            self.skipTest(f"no parser for {lang}")
+        unit = extract_unit(fname, src.encode(), lang, parser)
+        return {
+            s["name"]: s["kind"] for s in unit["symbols"] if s["name"] != "<module>"
+        }
+
+    def test_h_headers_use_the_cpp_grammar(self):
+        # C++ headers do not parse as C; C headers do parse as C++.
+        self.assertEqual(_language_for("include/q.h"), "cpp")
+
+    def test_cpp_specifiers_definitions_only(self):
+        syms = self._syms("q.h", (
+            "struct Node { int v; };\n"
+            "struct Node;\n"           # forward declaration
+            "struct Node make();\n"    # type reference in a return type
+            "enum Color { RED };\n"
+            "union Pack { int i; };\n"
+            "template <typename T> class Q { void push(T t); };\n"
+        ))
+        self.assertEqual(syms.get("Node"), "struct")
+        self.assertEqual(syms.get("Color"), "enum")
+        self.assertEqual(syms.get("Pack"), "union")
+        self.assertEqual(syms.get("Q"), "class")
+
+    def test_go_type_declarations(self):
+        syms = self._syms("s.go", (
+            "package p\n"
+            "type Server struct { port int }\n"
+            "type Handler interface { Serve() }\n"
+            "type Meters = float64\n"
+        ))
+        self.assertEqual(syms.get("Server"), "type")
+        self.assertEqual(syms.get("Handler"), "type")
+        self.assertEqual(syms.get("Meters"), "type")
+
+    def test_rust_items(self):
+        syms = self._syms("l.rs", (
+            "trait Animal { fn speak(&self); }\n"
+            "enum Shape { Circle }\n"
+            "union U { i: i32, f: f32 }\n"
+            "mod inner { pub fn g() {} }\n"
+            "type Meters = f64;\n"
+            "macro_rules! my_macro { () => {}; }\n"
+        ))
+        self.assertEqual(syms.get("Animal"), "interface")
+        self.assertEqual(syms.get("Shape"), "enum")
+        self.assertEqual(syms.get("U"), "union")
+        self.assertEqual(syms.get("inner"), "module")
+        self.assertEqual(syms.get("g"), "function")
+        self.assertEqual(syms.get("Meters"), "type")
+        self.assertEqual(syms.get("my_macro"), "macro")
+
+    def test_kotlin_functions_objects_and_no_val_flood(self):
+        syms = self._syms("w.kt", (
+            "object Config {\n"
+            "    fun load(): Int {\n"
+            "        val local = 5\n"
+            "        return local\n"
+            "    }\n"
+            "}\n"
+            "val topLevel = 10\n"
+            "class Widget {\n"
+            "    val member = 1\n"
+            "    fun draw() {}\n"
+            "}\n"
+        ))
+        self.assertEqual(syms.get("Config"), "class")
+        self.assertEqual(syms.get("load"), "function")
+        self.assertEqual(syms.get("Widget"), "class")
+        self.assertEqual(syms.get("draw"), "function")
+        # val/var declarations must not mint symbols: one per local would
+        # drown the catalog in noise.
+        for noise in ("local", "topLevel", "member"):
+            self.assertNotIn(noise, syms)
+
+    def test_ts_declarations(self):
+        syms = self._syms("t.ts", (
+            "type Alias = { a: number };\n"
+            "abstract class Abs { abstract m(): void; }\n"
+            "namespace Ns { export const inner = () => 1; }\n"
+            "enum Color { Red }\n"
+        ))
+        self.assertEqual(syms.get("Alias"), "type")
+        self.assertEqual(syms.get("Abs"), "class")
+        self.assertEqual(syms.get("Ns"), "module")
+        self.assertEqual(syms.get("Color"), "enum")
+        self.assertEqual(syms.get("inner"), "function")
+
+    def test_js_named_function_values_only(self):
+        syms = self._syms("v.js", (
+            "const arrow = (x) => x + 1;\n"
+            "const fexpr = function (y) { return y; };\n"
+            "function* gen() { yield 1; }\n"
+            "const num = 5;\n"
+            "setTimeout(() => { console.log(1); }, 10);\n"
+        ))
+        self.assertEqual(syms.get("arrow"), "function")
+        self.assertEqual(syms.get("fexpr"), "function")
+        self.assertEqual(syms.get("gen"), "function")
+        # Plain initializers and anonymous callbacks stay invisible.
+        self.assertNotIn("num", syms)
+        self.assertNotIn("setTimeout", syms)
+
+    def test_java_type_declarations_without_declarator_noise(self):
+        syms = self._syms("j.java", (
+            "enum Status { OK }\n"
+            "record PointR(int x, int y) {}\n"
+            "@interface Marker { String value(); }\n"
+            "class Box {\n"
+            "    int size = 5;\n"
+            "    void grow() { int step = 1; }\n"
+            "}\n"
+        ))
+        self.assertEqual(syms.get("Status"), "enum")
+        self.assertEqual(syms.get("PointR"), "class")
+        self.assertEqual(syms.get("Marker"), "interface")
+        # Java field/local declarators share the variable_declarator node
+        # type with JS but hold no function value: never symbols.
+        self.assertNotIn("size", syms)
+        self.assertNotIn("step", syms)
+
+    def test_csharp_declarations_without_lambda_noise(self):
+        syms = self._syms("c.cs", (
+            "struct Vec { public int X; }\n"
+            "enum Mode { A }\n"
+            "record Rec(int A);\n"
+            "class Svc {\n"
+            "    public int Count { get; set; }\n"
+            "    void Run() { System.Func<int,int> f = x => x; }\n"
+            "}\n"
+        ))
+        self.assertEqual(syms.get("Vec"), "struct")
+        self.assertEqual(syms.get("Mode"), "enum")
+        self.assertEqual(syms.get("Rec"), "class")
+        self.assertEqual(syms.get("Count"), "property")
+        self.assertNotIn("f", syms)  # lambda_expression: deliberately not a value type
+
+    def test_php_and_ruby_container_kinds(self):
+        php = self._syms("p.php", (
+            "<?php\n"
+            "trait Greets { public function hi() { return 'hi'; } }\n"
+            "enum Suit { case Hearts; }\n"
+        ))
+        self.assertEqual(php.get("Greets"), "interface")
+        self.assertEqual(php.get("Suit"), "enum")
+        rb = self._syms("r.rb", "module Helpers\n  def aid\n    1\n  end\nend\n")
+        self.assertEqual(rb.get("Helpers"), "module")
+        self.assertEqual(rb.get("aid"), "method")
+
+    def test_python_root_module_node_is_not_a_symbol(self):
+        # Python's root node type is literally "module". With "module" now
+        # in _DEF_KINDS (for ruby), the walk must start below the root or a
+        # top-level bare identifier names a phantom symbol that prefixes
+        # every qualified name in the file.
+        lang = _language_for("a.py")
+        parser = _load_parser(lang)
+        if parser is None:
+            self.skipTest("no python parser")
+        unit = extract_unit(
+            "a.py", b"import os\nflag\ndef f():\n    return 1\n", lang, parser
+        )
+        names = {s["name"] for s in unit["symbols"]}
+        self.assertEqual(names, {"<module>", "f"})
+        f = next(s for s in unit["symbols"] if s["name"] == "f")
+        self.assertEqual(f["qualified_name"], "f")  # no phantom prefix
+
+
+class StateDirKeyingTest(unittest.TestCase):
+    """Two campaign databases sharing a directory keep separate catalogs."""
+
+    def test_state_dirs_are_keyed_by_db_filename(self):
+        with tempfile.TemporaryDirectory(prefix="mantis_sidx_key_") as tmp:
+            alpha = state_dir_for_db(str(Path(tmp) / "alpha.db"))
+            beta = state_dir_for_db(str(Path(tmp) / "beta.db"))
+            self.assertNotEqual(alpha, beta)
+            self.assertEqual(Path(alpha).name, "alpha.structural_index")
+            self.assertEqual(Path(beta).name, "beta.structural_index")
+            self.assertEqual(Path(alpha).parent, Path(beta).parent)
+
+    def test_sibling_databases_do_not_clobber_each_other(self):
+        with tempfile.TemporaryDirectory(prefix="mantis_sidx_key2_") as tmp:
+            tmp_path = Path(os.path.realpath(tmp))
+            code_a = tmp_path / "a"
+            code_b = tmp_path / "b"
+            code_a.mkdir()
+            code_b.mkdir()
+            (code_a / "only_a.py").write_text("def alpha_fn():\n    return 1\n")
+            (code_b / "only_b.py").write_text("def beta_fn():\n    return 2\n")
+            db_a = str(tmp_path / "alpha.db")
+            db_b = str(tmp_path / "beta.db")
+            build_structural_index(str(code_a), state_dir_for_db(db_a), "s1")
+            build_structural_index(str(code_b), state_dir_for_db(db_b), "s2")
+            idx_a = StructuralIndex(state_dir_for_db(db_a))
+            idx_b = StructuralIndex(state_dir_for_db(db_b))
+            # Before the keyed layout the second build replaced the first:
+            # idx_a would serve beta_fn and report its own symbol missing.
+            self.assertEqual(idx_a.resolve_symbol("alpha_fn")["total"], 1)
+            self.assertEqual(idx_a.resolve_symbol("beta_fn")["total"], 0)
+            self.assertEqual(idx_b.resolve_symbol("beta_fn")["total"], 1)
+            self.assertEqual(idx_b.resolve_symbol("alpha_fn")["total"], 0)
 
 
 class WorkflowTopologyTest(unittest.TestCase):

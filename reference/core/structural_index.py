@@ -53,7 +53,7 @@ _EXT_LANGUAGES = {
     ".go": "go",
     ".rb": "ruby",
     ".php": "php",
-    ".c": "c", ".h": "c",
+    ".c": "c", ".h": "cpp",  # C++ headers do not parse as C; C headers do parse as C++
     ".cc": "cpp", ".cpp": "cpp", ".cxx": "cpp", ".hpp": "cpp", ".hh": "cpp",
     ".rs": "rust",
     ".kt": "kotlin", ".kts": "kotlin",
@@ -81,7 +81,46 @@ _DEF_KINDS = {
     "impl_item": "class",                  # rust impl blocks
     "preproc_def": "macro",                # c, cpp `#define FOO ...`
     "preproc_function_def": "macro",       # c, cpp `#define FOO(x) ...`
+    "type_spec": "type",                   # go `type Foo struct/interface {...}`
+    "type_alias": "type",                  # go `type Alias = Foo`
+    "struct_specifier": "struct",          # c, cpp (definitions only; see _BODY_REQUIRED)
+    "enum_specifier": "enum",              # c, cpp
+    "union_specifier": "union",            # c, cpp
+    "trait_item": "interface",             # rust `trait Foo { ... }`
+    "enum_item": "enum",                   # rust
+    "union_item": "union",                 # rust
+    "mod_item": "module",                  # rust `mod foo { ... }`
+    "type_item": "type",                   # rust `type Alias = Foo`
+    "macro_definition": "macro",           # rust `macro_rules! foo`
+    "object_declaration": "class",         # kotlin `object Foo { ... }`
+    "generator_function_declaration": "function",  # js/ts `function* gen() {...}`
+    "type_alias_declaration": "type",      # ts `type Alias = {...}`
+    "abstract_class_declaration": "class", # ts `abstract class Foo {...}`
+    "internal_module": "module",           # ts `namespace Ns {...}`
+    "enum_declaration": "enum",            # ts, java, csharp, php 8.1
+    "record_declaration": "class",         # java, csharp records
+    "annotation_type_declaration": "interface",  # java `@interface Anno {...}`
+    "struct_declaration": "struct",        # csharp
+    "property_declaration": "property",    # csharp properties; php class fields
+    "trait_declaration": "interface",      # php traits (mixin; kind matches rust trait_item)
+    "module": "module",                    # ruby `module Foo ... end`
 }
+
+# C/C++ type specifiers appear both at definitions (`struct Foo { ... };`) and
+# at every forward declaration or type reference (`struct Foo x;`). Only a
+# node with a body is a definition; indexing the rest would mint one fake
+# symbol per usage site.
+_BODY_REQUIRED = frozenset({
+    "class_specifier", "struct_specifier", "enum_specifier", "union_specifier",
+})
+
+# `const f = () => {...}` binds a NAME to a function: unlike a truly anonymous
+# lambda it is navigable, so it earns a symbol. The declarator's `value` field
+# type distinguishes it from ordinary variable initialization (`const x = 5`).
+# Java/C# lambdas parse as `lambda_expression`, deliberately not listed here.
+_FUNCTION_VALUE_TYPES = frozenset({
+    "arrow_function", "function_expression", "generator_function",  # js/ts
+})
 
 _CALL_TYPES = frozenset({
     "call",                      # python, ruby
@@ -98,6 +137,7 @@ _CALL_TYPES = frozenset({
 _NAME_LEAF_TYPES = frozenset({
     "identifier", "property_identifier", "field_identifier",
     "type_identifier", "constant", "name", "word",
+    "simple_identifier",  # kotlin: its grammar exposes no `name` field at all
 })
 
 
@@ -209,11 +249,25 @@ def extract_unit(rel_path: str, source: bytes, language: str, parser) -> Dict[st
     })
 
     # Iterative walk with an explicit enclosing-definition stack, so every
-    # call edge is attributed to its innermost named definition.
-    stack: List[Tuple[Any, List[Tuple[str, str]]]] = [(tree.root_node, [])]
+    # call edge is attributed to its innermost named definition. The walk
+    # starts BELOW the root: the file itself is already represented by the
+    # synthetic <module> symbol, and python's root node type is literally
+    # "module" — letting it match _DEF_KINDS would mint a spurious symbol
+    # named after the first top-level bare identifier (this grammar keeps
+    # bare-expression identifiers as DIRECT children of the root) and then
+    # prefix every qualified name in the file with it.
+    stack: List[Tuple[Any, List[Tuple[str, str]]]] = [
+        (child, []) for child in reversed(tree.root_node.named_children)
+    ]
     while stack:
         node, enclosing = stack.pop()
         kind = _DEF_KINDS.get(node.type)
+        if kind is not None and node.type in _BODY_REQUIRED and node.child_by_field_name("body") is None:
+            kind = None  # forward declaration / type reference, not a definition
+        if kind is None and node.type == "variable_declarator":
+            value = node.child_by_field_name("value")
+            if value is not None and value.type in _FUNCTION_VALUE_TYPES:
+                kind = "function"  # named `const f = () => ...` (js/ts)
         if kind is not None:
             name = _node_name(node)
             if name:
@@ -803,5 +857,13 @@ class StructuralIndex:
 
 
 def state_dir_for_db(db_path: str) -> str:
-    """The catalog lives next to the campaign database."""
-    return str(Path(db_path).resolve().parent / STATE_DIRNAME)
+    """The catalog lives next to the campaign database, keyed by its filename.
+
+    Keying by the database name (knowledge.db -> knowledge.structural_index/)
+    keeps two campaign databases that share a directory from silently serving
+    each other's catalogs with status "complete" (each build clobbered the
+    shared <dir>/structural_index). Cost: pre-existing unkeyed state dirs are
+    orphaned and rebuilt once on first use.
+    """
+    db = Path(db_path).resolve()
+    return str(db.parent / f"{db.stem}.{STATE_DIRNAME}")
