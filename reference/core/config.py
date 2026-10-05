@@ -398,6 +398,24 @@ class MantisStreamingTruncationError(RuntimeError):
     pass
 
 
+class MantisStreamInterruptedError(RuntimeError):
+    """Raised when a resilient stream fails after at least one chunk was delivered.
+
+    Everything before the first chunk is retried transparently: no output has been
+    observed, so a fresh stream is equivalent to a slow first attempt. After that,
+    a transparent retry would re-sample the model and splice two different
+    completions together -- silently corrupting output the consumer has already
+    processed. The wrapper therefore refuses to guess: it reports how far delivery
+    got and leaves the continuation policy (re-prompt, discard, resume) to the
+    caller.
+    """
+
+    def __init__(self, message: str, chunks_yielded: int = 0, original_exception: Optional[Exception] = None):
+        super().__init__(message)
+        self.chunks_yielded = chunks_yielded
+        self.original_exception = original_exception
+
+
 class ContextBudgetExceededError(RuntimeError):
     """Raised before dispatch when a request cannot possibly fit the model's context window.
 
@@ -927,13 +945,22 @@ except Exception:
 
 
 class ResilientLiteLLMClient(LiteLLMClient):
-    """LiteLLMClient with full jitter exponential backoff (min offset 5s, 1h patience) on 429/quota exhaustion."""
+    """LiteLLMClient with full jitter exponential backoff (min offset 5s, 1h patience) on 429/quota exhaustion.
+
+    Streaming (stream=True) is supported on both dispatch paths with a precise
+    resilience boundary: every failure up to and including the first chunk re-enters
+    the same backoff/auth-refresh loop as a non-streaming call, while a failure after
+    the first chunk raises MantisStreamInterruptedError instead of retrying --
+    sampling is nondeterministic, so a transparent restart would splice two different
+    completions together. The consumer owns any continuation policy.
+    """
 
     async def acompletion(
         self,
         model: Any,
         messages: Any,
         tools: Any = None,
+        stream: bool = False,
         **kwargs: Any,
     ) -> Any:
         import litellm
@@ -941,6 +968,13 @@ class ResilientLiteLLMClient(LiteLLMClient):
         # Before the retry loop, not inside it: an oversized request is deterministic, so
         # every pass through the loop would upload the same doomed payload again.
         enforce_context_budget(model, messages, tools)
+
+        if stream:
+            # Returned, not awaited into a response: callers receive the async
+            # iterator directly (response = await client.acompletion(..., stream=True);
+            # async for chunk in response). The context budget above still runs
+            # eagerly, at call time, not at first iteration.
+            return self._astream_with_retry(model, messages, tools, kwargs)
 
         max_patience = float(os.environ.get("MANTIS_LLM_MAX_PATIENCE_SECONDS", "3600.0"))
         initial_delay = float(os.environ.get("MANTIS_LLM_RETRY_INITIAL_DELAY", "5.0"))
@@ -1002,6 +1036,113 @@ class ResilientLiteLLMClient(LiteLLMClient):
                 )
                 await asyncio.sleep(delay)
 
+    async def _astream_with_retry(
+        self,
+        model: Any,
+        messages: Any,
+        tools: Any,
+        kwargs: dict,
+    ) -> Any:
+        """Streams a completion with retries confined to the pre-first-chunk window.
+
+        Everything up to and including the first chunk re-enters the full jitter
+        backoff / auth-refresh loop: no output has been delivered yet, so re-opening
+        the stream is indistinguishable from a slow first attempt. The patience clock
+        is shared across restarts (never reset per attempt). Once a chunk has been
+        yielded, a failure raises MantisStreamInterruptedError instead of retrying:
+        sampling is nondeterministic, so a transparent restart would splice two
+        different completions together behind the consumer's back.
+        """
+        import litellm
+
+        max_patience = float(os.environ.get("MANTIS_LLM_MAX_PATIENCE_SECONDS", "3600.0"))
+        initial_delay = float(os.environ.get("MANTIS_LLM_RETRY_INITIAL_DELAY", "5.0"))
+        max_delay = float(os.environ.get("MANTIS_LLM_RETRY_MAX_DELAY", "60.0"))
+        min_offset = float(os.environ.get("MANTIS_LLM_MIN_OFFSET", "5.0"))
+        backoff_factor = float(os.environ.get("MANTIS_LLM_RETRY_BACKOFF", "2.0"))
+
+        start_time = time.time()
+        attempt = 0
+        auth_refreshed = False
+        while True:
+            try:
+                response = await litellm.acompletion(
+                    model=model,
+                    messages=messages,
+                    tools=tools,
+                    stream=True,
+                    **kwargs,
+                )
+                stream_iter = response.__aiter__()
+                try:
+                    first_chunk = await stream_iter.__anext__()
+                except StopAsyncIteration:
+                    # An empty stream is a successfully completed (if silent) response.
+                    return
+            except Exception as e:
+                if is_auth_error(e):
+                    if not auth_refreshed and is_token_refreshable_auth_error(e) and try_refresh_auth():
+                        auth_refreshed = True
+                        print(f"\n[AUTH REFRESH] Token refreshed for '{model}'; retrying stream request...", file=sys.stderr, flush=True)
+                        continue
+                    raise MantisAuthError(
+                        format_auth_error_message(e, model=str(model)),
+                        original_exception=e,
+                    ) from None
+
+                elapsed = time.time() - start_time
+                if not is_retryable_llm_error(e) or elapsed >= max_patience:
+                    raise
+
+                remaining = max_patience - elapsed
+                retry_after = extract_retry_after(e)
+                delay = compute_full_jitter_delay(
+                    attempt=attempt,
+                    initial_delay=initial_delay,
+                    max_delay=max_delay,
+                    min_offset=min_offset,
+                    backoff_factor=backoff_factor,
+                    retry_after=retry_after,
+                    max_remaining=remaining,
+                )
+
+                attempt += 1
+                model_name = str(model)
+                if is_rate_limit_error(e):
+                    err_detail = extract_rate_limit_detail(e)
+                    prefix = f"[RATE LIMIT] 429 Quota Exceeded on '{model_name}'"
+                else:
+                    err_detail = f"{type(e).__name__}: {e}"
+                    prefix = f"[LLM RETRY] Transient error on '{model_name}'"
+                print(
+                    f"\n{prefix}. "
+                    f"Full jitter backoff: pausing {delay:.1f}s before stream retry (attempt {attempt}, elapsed {elapsed:.1f}s / {max_patience:.0f}s patience) [{err_detail}]...",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                await asyncio.sleep(delay)
+                continue
+
+            break
+
+        yield first_chunk
+        chunks_yielded = 1
+        while True:
+            try:
+                chunk = await stream_iter.__anext__()
+            except StopAsyncIteration:
+                return
+            except Exception as e:
+                raise MantisStreamInterruptedError(
+                    f"Stream from '{model}' failed after {chunks_yielded} chunk(s) were already delivered "
+                    f"({type(e).__name__}: {e}). A transparent retry would re-sample the model and splice "
+                    "two different completions together; the consumer owns the continuation policy.",
+                    chunks_yielded=chunks_yielded,
+                    original_exception=e,
+                ) from e
+            yield chunk
+            chunks_yielded += 1
+
     def completion(
         self,
         model: Any,
@@ -1015,6 +1156,11 @@ class ResilientLiteLLMClient(LiteLLMClient):
         # Both dispatch paths are guarded: a control that only covers the async path is a
         # control that a single synchronous caller silently disables.
         enforce_context_budget(model, messages, tools)
+
+        if stream:
+            # Same boundary as the async path, for the same reason the context
+            # budget guards both dispatch paths.
+            return self._stream_with_retry(model, messages, tools, kwargs)
 
         max_patience = float(os.environ.get("MANTIS_LLM_MAX_PATIENCE_SECONDS", "3600.0"))
         initial_delay = float(os.environ.get("MANTIS_LLM_RETRY_INITIAL_DELAY", "5.0"))
@@ -1076,6 +1222,103 @@ class ResilientLiteLLMClient(LiteLLMClient):
                     flush=True,
                 )
                 time.sleep(delay)
+
+    def _stream_with_retry(
+        self,
+        model: Any,
+        messages: Any,
+        tools: Any,
+        kwargs: dict,
+    ) -> Any:
+        """Sync mirror of _astream_with_retry; see that method for the boundary rationale."""
+        import litellm
+
+        max_patience = float(os.environ.get("MANTIS_LLM_MAX_PATIENCE_SECONDS", "3600.0"))
+        initial_delay = float(os.environ.get("MANTIS_LLM_RETRY_INITIAL_DELAY", "5.0"))
+        max_delay = float(os.environ.get("MANTIS_LLM_RETRY_MAX_DELAY", "60.0"))
+        min_offset = float(os.environ.get("MANTIS_LLM_MIN_OFFSET", "5.0"))
+        backoff_factor = float(os.environ.get("MANTIS_LLM_RETRY_BACKOFF", "2.0"))
+
+        start_time = time.time()
+        attempt = 0
+        auth_refreshed = False
+        while True:
+            try:
+                response = litellm.completion(
+                    model=model,
+                    messages=messages,
+                    tools=tools,
+                    stream=True,
+                    **kwargs,
+                )
+                stream_iter = iter(response)
+                try:
+                    first_chunk = next(stream_iter)
+                except StopIteration:
+                    return
+            except Exception as e:
+                if is_auth_error(e):
+                    if not auth_refreshed and is_token_refreshable_auth_error(e) and try_refresh_auth():
+                        auth_refreshed = True
+                        print(f"\n[AUTH REFRESH] Token refreshed for '{model}'; retrying stream request...", file=sys.stderr, flush=True)
+                        continue
+                    raise MantisAuthError(
+                        format_auth_error_message(e, model=str(model)),
+                        original_exception=e,
+                    ) from None
+
+                elapsed = time.time() - start_time
+                if not is_retryable_llm_error(e) or elapsed >= max_patience:
+                    raise
+
+                remaining = max_patience - elapsed
+                retry_after = extract_retry_after(e)
+                delay = compute_full_jitter_delay(
+                    attempt=attempt,
+                    initial_delay=initial_delay,
+                    max_delay=max_delay,
+                    min_offset=min_offset,
+                    backoff_factor=backoff_factor,
+                    retry_after=retry_after,
+                    max_remaining=remaining,
+                )
+
+                attempt += 1
+                model_name = str(model)
+                if is_rate_limit_error(e):
+                    err_detail = extract_rate_limit_detail(e)
+                    prefix = f"[RATE LIMIT] 429 Quota Exceeded on '{model_name}'"
+                else:
+                    err_detail = f"{type(e).__name__}: {e}"
+                    prefix = f"[LLM RETRY] Transient error on '{model_name}'"
+                print(
+                    f"\n{prefix}. "
+                    f"Full jitter backoff: pausing {delay:.1f}s before stream retry (attempt {attempt}, elapsed {elapsed:.1f}s / {max_patience:.0f}s patience) [{err_detail}]...",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                time.sleep(delay)
+                continue
+
+            break
+
+        yield first_chunk
+        chunks_yielded = 1
+        while True:
+            try:
+                chunk = next(stream_iter)
+            except StopIteration:
+                return
+            except Exception as e:
+                raise MantisStreamInterruptedError(
+                    f"Stream from '{model}' failed after {chunks_yielded} chunk(s) were already delivered "
+                    f"({type(e).__name__}: {e}). A transparent retry would re-sample the model and splice "
+                    "two different completions together; the consumer owns the continuation policy.",
+                    chunks_yielded=chunks_yielded,
+                    original_exception=e,
+                ) from e
+            yield chunk
+            chunks_yielded += 1
 
 
 class ResilientLiteLlm(LiteLlm):
