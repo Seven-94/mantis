@@ -1283,15 +1283,10 @@ def record_okf_concept(db_path: str, run_id: str, concept: Dict[str, Any]):
         title = concept.get("title") or concept_id
         _iso_default = lambda o: o.isoformat() if hasattr(o, "isoformat") else str(o)
         res = canonical_filepath(concept.get("resource") or "", target_file=concept.get("resource") or "") if concept.get("resource") else ""
-        # UNIQUE(run_id, concept_id) cannot be widened to include the resource
-        # without a schema version bump (which forces users to delete their
-        # databases), so per-file concepts qualify their id with the resource
-        # instead: a frontmatter-less THREAT_MODEL.md carries the same default
-        # id for every file in a multi-file sweep, and file 2's INSERT OR
-        # REPLACE would otherwise evict file 1's row. The endswith guard keeps
-        # export/import roundtrips from qualifying twice.
-        if res and not concept_id.endswith(f"@{res}"):
-            concept_id = f"{concept_id}@{res}"
+        # Explicit ids are stored verbatim. Qualification of collision-prone
+        # default ids (same-run multi-file sweeps re-recording the same repo
+        # document per file) happens in record_artifact, the only path that
+        # mints the same default id for different files.
         tags_str = json.dumps(concept.get("tags") or [], default=_iso_default)
         status = concept.get("status") or "stable"
         trust_tier = concept.get("trust_tier") or "unverified"
@@ -1631,6 +1626,22 @@ def record_artifact(db_path: str, run_id: str, artifact_type: str, filepath: str
                         is_file_scoped = True
                     if not parsed.get("resource") and candidate_resource and is_file_scoped:
                         parsed["resource"] = canonical_filepath(candidate_resource, target_file=candidate_resource)
+                    # UNIQUE(run_id, concept_id) cannot be widened to include
+                    # the resource without a schema version bump (which forces
+                    # users to delete their databases), so a repo document
+                    # scoped to a single scanned file qualifies its id with
+                    # that file: a frontmatter-less THREAT_MODEL.md carries
+                    # the same default id for every file in a multi-file
+                    # sweep, and file 2's INSERT OR REPLACE would otherwise
+                    # evict file 1's row. Explicit ids recorded through
+                    # record_okf_concept directly (CRUD, bundle import) are
+                    # stored verbatim; the endswith guard keeps re-recorded
+                    # artifacts from qualifying twice.
+                    if doc_type in repo_doc_types and is_file_scoped and parsed.get("resource"):
+                        res_q = str(parsed["resource"])
+                        cid = str(parsed.get("concept_id") or "")
+                        if cid and not cid.endswith(f"@{res_q}"):
+                            parsed["concept_id"] = f"{cid}@{res_q}"
                     if not parsed.get("snapshot_id") and metadata.get("snapshot_id"):
                         parsed["snapshot_id"] = metadata["snapshot_id"]
                     if metadata.get("verified_by") and not parsed.get("verified_by"):
