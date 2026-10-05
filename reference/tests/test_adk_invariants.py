@@ -722,7 +722,14 @@ class TestADKInvariants(unittest.IsolatedAsyncioTestCase):
             # Discovered workflow must NOT be the untrusted one in CWD
             self.assertNotEqual(discovered, str(untrusted_wf))
             self.assertTrue(discovered.endswith("workflow.json"))
-            self.assertIn("reference", discovered)
+            # Anchored at THIS install root, whatever the checkout is named
+            # (the old `assertIn("reference", discovered)` failed on any
+            # clone not literally named "reference").
+            install_root = str(Path(__file__).resolve().parent.parent)
+            self.assertTrue(
+                discovered.startswith(install_root),
+                f"Discovered workflow not anchored at install root: {discovered}",
+            )
         finally:
             os.chdir(original_cwd)
 

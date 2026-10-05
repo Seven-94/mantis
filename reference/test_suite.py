@@ -213,7 +213,6 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
             (
                 [
                     "History extracted.",
-                    "Structural index built.",
                     "Architecture KB created.",
                     "Threat model created.",
                     "Plan created.",
@@ -234,7 +233,6 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
             (
                 [
                     "History extracted.",
-                    "Structural index built.",
                     "Architecture KB created.",
                     "Threat model created.",
                     "Plan created.",
@@ -254,7 +252,6 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
             (
                 [
                     "History extracted.",
-                    "Structural index built.",
                     "Architecture KB created.",
                     "Threat model created.",
                     "Plan created.",
@@ -265,7 +262,7 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
                     "Learnings reflected.",
                     "Report generated.",
                 ],
-                "reported",
+                "false_positive",
                 False,
             ),
         ]
@@ -770,6 +767,17 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
             res_exec = await run_sandbox("echo test")
             self.assertEqual(res_exec, "exit=0\nok")
             mock_sb.execute.assert_called_once_with("echo test")
+            # INV-1 tightening: a command merely running is NOT dynamic
+            # evidence. The flag is derived solely from reached-sink proof
+            # (check_reached_sink_evidence); the old "any exit code but 127"
+            # standard this test originally asserted was removed on main.
+            self.assertFalse(ctx.sandbox_executed)
+
+            # A sentinel-bearing trace IS reached-sink evidence.
+            from tools.sandbox_tools import MANTIS_SENTINEL_TOKEN
+            mock_sb.execute.return_value = f"exit=0\n{MANTIS_SENTINEL_TOKEN} hit"
+            res_evid = await run_sandbox("./poc")
+            self.assertIn(MANTIS_SENTINEL_TOKEN, res_evid)
             self.assertTrue(ctx.sandbox_executed)
 
             res_patch = await apply_patch("test_diff")
@@ -2075,7 +2083,6 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
         workflow_path = os.path.join(os.path.dirname(__file__), "workflow.json")
         full_queue = [
             "History extracted.",
-            "Structural index built.",
             "Architecture KB created.",
             "Threat model created.",
             "Plan created.",
@@ -2156,7 +2163,12 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
             finally:
                 current_run_context.reset(tok)
 
-            # 3. When current_run_context is None (no context), finding status is NOT elevated to dynamic_confirmed
+            # 3. When current_run_context is None (no context), no status stamp can
+            # fire at all: completion-stamp callbacks are context-anchored
+            # (graph_loader._make_completion_stamp_callback returns early with no
+            # RunContext), so the finding stays at its initial status. Strictly
+            # more conservative than the old entry-time behavior this test
+            # originally encoded (which still downgraded to static_confirmed).
             queue = list(full_queue)
             run_id_noctx = "run-gated-noctx"
             write_findings(db_path, target_file, [f], run_id=run_id_noctx)
@@ -2170,7 +2182,7 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
             )
             self.assertFalse(err)
             findings = read_findings(db_path, target_file, run_id=run_id_noctx)
-            self.assertEqual(findings[0]["status"], "static_confirmed")
+            self.assertEqual(findings[0]["status"], "reported")
         finally:
             await runner.close()
             shutil.rmtree(temp_dir)
