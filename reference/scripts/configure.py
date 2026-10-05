@@ -886,6 +886,7 @@ async def ensure_configured_async(
     save: bool = True,
     save_tracked: bool = False,
     probe_llm: bool = False,
+    persist_overrides: bool = False,
 ) -> dict:
     """Ensures workflow configuration is valid asynchronously. Auto-resolves defaults or prompts if needed."""
     target_wf = find_workflow_json(workflow_path)
@@ -1004,8 +1005,13 @@ async def ensure_configured_async(
                     os.environ.setdefault("VERTEXAI_PROJECT", resolved_proj)
                     os.environ.setdefault("GOOGLE_CLOUD_PROJECT", resolved_proj)
 
+        # One-shot CLI overrides are already live for THIS run (applied above
+        # with save=False, and re-applied by main.py via
+        # load_workflow_from_json(*_override)). A per-invocation flag must
+        # never become sticky configuration unless the operator explicitly
+        # opts in with --save-config; auto-resolution results always persist.
         if updates or overrides:
-            all_updates = {**updates, **overrides}
+            all_updates = {**updates, **overrides} if persist_overrides else dict(updates)
             # Safety net: never allow a downgraded sandbox type to be persisted to disk
             if all_updates.get("sandbox", {}).get("type") == "static-only" and sb_type not in ("", "static-only"):
                 del all_updates["sandbox"]
@@ -1029,6 +1035,7 @@ def ensure_configured(
     save: bool = True,
     save_tracked: bool = False,
     probe_llm: bool = False,
+    persist_overrides: bool = False,
 ) -> dict:
     """Ensures workflow configuration is valid. Auto-resolves defaults or prompts if needed."""
     try:
@@ -1049,6 +1056,7 @@ def ensure_configured(
                     save=save,
                     save_tracked=save_tracked,
                     probe_llm=probe_llm,
+                    persist_overrides=persist_overrides,
                 ),
             ).result()
     else:
@@ -1061,6 +1069,7 @@ def ensure_configured(
                 save=save,
                 save_tracked=save_tracked,
                 probe_llm=probe_llm,
+                persist_overrides=persist_overrides,
             )
         )
 

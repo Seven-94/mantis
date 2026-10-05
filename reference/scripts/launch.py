@@ -36,8 +36,21 @@ from scripts.configure import (
 )
 
 
+class _LauncherArgumentParser(argparse.ArgumentParser):
+    """Exits 64 (EX_USAGE) on CLI usage errors instead of argparse's default 2.
+
+    Exit code 2 is documented by Mantis as "paused at budget" (and main.py
+    uses it that way), so a CI wrapper could not distinguish a typo'd flag
+    from a resumable pause on the launch.py path.
+    """
+
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        self.exit(64, f"{self.prog}: error: {message}\n")
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = _LauncherArgumentParser(
         description="Mantis Campaign Launcher: Automated Security Review Pipeline"
     )
     parser.add_argument("target", nargs="?", default=".", help="Target source file or repository directory to review")
@@ -65,6 +78,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--timeout", type=float, help="LLM request timeout in seconds")
     parser.add_argument("--db", "-d", type=str, help="Path to knowledge SQLite database")
+    parser.add_argument(
+        "--save-config",
+        action="store_true",
+        help=(
+            "Persist CLI overrides (--model, --db, --sandbox, ...) into "
+            "workflow.local.json. Without this flag overrides apply to this "
+            "run only."
+        ),
+    )
     parser.add_argument(
         "--flex",
         action="store_true",
@@ -240,6 +262,7 @@ def run_launch(
     resume_run_id: str = "",
     inspect: bool = False,
     synthesize_llm: bool = True,
+    save_config: bool = False,
 ) -> int:
     """Core launch workflow: auto-configures, preflights, and executes the Mantis pipeline."""
     if flex:
@@ -303,6 +326,7 @@ def run_launch(
                 auto=True,
                 overrides=overrides,
                 probe_llm=probe_llm,
+                persist_overrides=save_config,
             )
         ok, messages = run_preflight_checks(cfg, target_path=str(target_path), probe_llm=probe_llm)
         if not ok:
@@ -461,6 +485,7 @@ def run_launch(
                 auto=True,
                 overrides=overrides if overrides else None,
                 probe_llm=probe_llm,
+                persist_overrides=save_config,
             )
 
     # Preflight Check
@@ -473,6 +498,7 @@ def run_launch(
                 auto=True,
                 overrides=overrides if overrides else None,
                 probe_llm=probe_llm,
+                persist_overrides=save_config,
             )
             ok, messages = run_preflight_checks(cfg, target_path=str(target_path), probe_llm=probe_llm)
         else:
@@ -583,6 +609,7 @@ def main() -> int:
         resume_run_id=args.resume,
         inspect=args.inspect,
         synthesize_llm=args.synthesize_llm,
+        save_config=args.save_config,
     )
 
 

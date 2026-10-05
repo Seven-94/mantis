@@ -1013,6 +1013,7 @@ async def pipeline(
     focus: str = "",
     seed_report_path: str = "",
     path_root: str = "",
+    save_config: bool = False,
 ):
     """Main pipeline loop compiled declaratively from JSON specification."""
     if not workflow_path:
@@ -1036,7 +1037,12 @@ async def pipeline(
                 overrides["timeout"] = timeout_override
             if reasoning_effort_override:
                 overrides["reasoning_effort"] = reasoning_effort_override
-            await ensure_configured_async(workflow_path, auto=True, overrides=overrides if overrides else None)
+            await ensure_configured_async(
+                workflow_path,
+                auto=True,
+                overrides=overrides if overrides else None,
+                persist_overrides=save_config,
+            )
         except Exception as ce:
             print(f"[CONFIG WARNING] Auto-configuration check: {ce}", file=sys.stderr)
 
@@ -1115,8 +1121,8 @@ async def pipeline(
     # repository prefix is lost ("routes/login.ts" stored as "login.ts");
     # only the caller knows the enclosing repository. An anchor that is not
     # an ancestor of the target could never yield a relative path, so it is
-    # dropped with a warning instead of trusted (INV-6: absence of the flag
-    # is the old behaviour).
+    # rejected before any budget is spent (absence of the flag is still the
+    # old unrooted behaviour).
     resolved_path_root = ""
     if path_root:
         _root = os.path.realpath(os.path.expanduser(path_root))
@@ -1124,11 +1130,17 @@ async def pipeline(
         if os.path.isdir(_root) and (_tgt == _root or _tgt.startswith(_root + os.sep)):
             resolved_path_root = _root
         else:
+            reason = (
+                "not a directory" if not os.path.isdir(_root)
+                else "not an ancestor directory of the target"
+            )
             print(
-                f"[WARN] --path-root '{path_root}' is not an ancestor directory "
-                "of the target; ignoring it.",
+                f"Error: --path-root '{path_root}' is {reason} "
+                f"(target resolves to {_tgt}). Pass an ancestor directory, or "
+                "omit --path-root for unrooted single-file behaviour.",
                 file=sys.stderr,
             )
+            return 1
     # An explicit --scan-mode beats workflow config. Copied rather than mutated in place:
     # `config` is the loaded workflow and is written back out in places, and a CLI flag
     # for one run must not rewrite the operator's file.
@@ -2161,6 +2173,15 @@ def parse_cli_args():
     parser.add_argument("--timeout", type=float, help="LLM timeout in seconds")
     parser.add_argument("--db", "-d", type=str, help="Knowledge SQLite DB path")
     parser.add_argument(
+        "--save-config",
+        action="store_true",
+        help=(
+            "Persist CLI overrides (--model, --db, --sandbox, ...) into "
+            "workflow.local.json. Without this flag overrides apply to this "
+            "run only."
+        ),
+    )
+    parser.add_argument(
         "--no-auto-configure",
         action="store_true",
         help="Disable auto-configuration of unconfigured placeholders",
@@ -2303,6 +2324,7 @@ if __name__ == "__main__":
                 focus=args.focus,
                 seed_report_path=args.seed_report,
                 path_root=args.path_root,
+                save_config=args.save_config,
             )
         )
         sys.exit(exit_code)
