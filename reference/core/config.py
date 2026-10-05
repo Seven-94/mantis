@@ -447,6 +447,15 @@ _NON_RETRYABLE_EXC_NAMES = (
     "MantisAuthError",
     "ContextBudgetExceededError",
     "ContextWindowExceededError",
+    # litellm 4xx families whose outcome is fully determined by the request;
+    # re-running the identical request can only reproduce the failure.
+    "NotFoundError",
+    "BadRequestError",
+    "AuthenticationError",
+    "PermissionDeniedError",
+    "UnprocessableEntityError",
+    "ContentPolicyViolationError",
+    "UnsupportedParamsError",
 )
 
 

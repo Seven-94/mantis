@@ -221,8 +221,8 @@ SCENARIOS = {
     ],
     "scale_revert_overflow_nonretryable": [
         ("core/config.py",
-         '    "ContextBudgetExceededError",\n    "ContextWindowExceededError",\n)',
-         ")  # NEUTERED: overflow is retried three times identically"),
+         '    "ContextBudgetExceededError",\n    "ContextWindowExceededError",',
+         "    # NEUTERED: overflow is retried three times identically"),
     ],
     "scale_revert_capacity_sentinel": [
         ("tools/research_tools.py",
