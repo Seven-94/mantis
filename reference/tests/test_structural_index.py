@@ -77,6 +77,70 @@ def _write_fixture(code: Path):
     (code / "README.md").write_text("# docs\n")
 
 
+CPP_WIDGET_CC = '''\
+class Widget {
+ public:
+  Widget& assign(const Widget& other);
+  bool operator==(const Widget& other) const { return true; }
+  ~Widget() {}
+  operator bool() const { return true; }
+  int& ref_count() { return count_; }
+ private:
+  int count_;
+};
+
+Widget& Widget::assign(const Widget& other) { return *this; }
+'''
+
+
+class CppDeclaratorNamingTest(unittest.TestCase):
+    """C++ members behind field-less declarator wrappers get real names.
+
+    `T& f()` must mint f (cpp reference_declarator exposes no fields, so
+    the chain walker previously fell back to the return type), operators
+    and destructors are name terminals, and conversion operators follow
+    ctags semantics ("operator <type>").
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix="mantis_sidx_cpp_")
+        self.addCleanup(self._tmp.cleanup)
+        tmp = Path(os.path.realpath(self._tmp.name))
+        code = tmp / "code"
+        code.mkdir()
+        (code / "widget.cc").write_text(CPP_WIDGET_CC)
+        res = build_structural_index(str(code), str(tmp / "state"), "snapcpp")
+        if res["status"] != "complete":
+            self.skipTest("cpp grammar unavailable in this environment")
+        self.idx = StructuralIndex(str(tmp / "state"))
+
+    def _only(self, name):
+        res = self.idx.resolve_symbol(name)
+        self.assertEqual(res["total"], 1, f"{name!r} should resolve uniquely")
+        return res["results"][0]
+
+    def test_reference_return_members_keep_their_names(self):
+        self.assertEqual(
+            self._only("ref_count")["qualified_name"], "Widget.ref_count"
+        )
+        self.assertEqual(self._only("assign")["name"], "assign")
+
+    def test_return_type_does_not_pollute_class_lookups(self):
+        self.assertEqual(self._only("Widget")["kind"], "class")
+
+    def test_operators_destructors_and_conversions_are_minted(self):
+        self.assertEqual(
+            self._only("operator==")["qualified_name"], "Widget.operator=="
+        )
+        self.assertEqual(
+            self._only("~Widget")["qualified_name"], "Widget.~Widget"
+        )
+        self.assertEqual(
+            self._only("operator bool")["qualified_name"],
+            "Widget.operator bool",
+        )
+
+
 class BuildTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory(prefix="mantis_sidx_build_")

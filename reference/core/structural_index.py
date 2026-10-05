@@ -173,10 +173,37 @@ def _node_name(node) -> str:
         decl = node.child_by_field_name("declarator")
         probe, depth = decl, 0
         while probe is not None and depth < 6:
-            if probe.type in _NAME_LEAF_TYPES:
+            if probe.type in _NAME_LEAF_TYPES or probe.type in ("operator_name", "destructor_name"):
+                # operator_name / destructor_name: `T operator()(...)`,
+                # `~Foo()` — the token IS the name (ctags does the same).
+                # Without this, operators are inconsistently dropped
+                # (bool operator==) or named after their return type
+                # (T operator() -> "T"), and destructors either vanish or
+                # collide with constructor names.
                 named = probe
                 break
-            probe = probe.child_by_field_name("declarator") or probe.child_by_field_name("name")
+            if probe.type == "operator_cast":
+                # Conversion operator `operator bool() const`: the name is
+                # "operator <type>" (ctags semantics); the node's text would
+                # drag in the parameter list and qualifiers.
+                type_child = probe.child_by_field_name("type")
+                if type_child is not None:
+                    try:
+                        return "operator " + type_child.text.decode("utf-8", errors="replace")
+                    except Exception:
+                        return ""
+                return ""
+            nxt = probe.child_by_field_name("declarator") or probe.child_by_field_name("name")
+            if nxt is None:
+                # Some wrappers (cpp `reference_declarator`: `T& f(...)`)
+                # expose NO fields; their declarator child continues the
+                # chain. Without this, the fallback below grabs the return
+                # type and names the function after it (e.g. "T").
+                for child in probe.named_children:
+                    if child.type.endswith("declarator") or child.type in _NAME_LEAF_TYPES:
+                        nxt = child
+                        break
+            probe = nxt
             depth += 1
     if named is None:
         for child in node.named_children:
