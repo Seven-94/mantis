@@ -87,7 +87,6 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
             (
                 [
                     "History extracted.",
-                    "Structural index built.",
                     "Architecture KB created.",
                     "Threat model created.",
                     "Plan created.",
@@ -98,45 +97,41 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
                     json.dumps({"route": "success", "reason": "Exploit successfully reproduced vulnerability."}),
                     "Exploit chained.",
                     "Patch created and applied successfully.",
-                    "Calibration score: 90",
                     "Learnings reflected.",
                     "Report generated.",
                 ],
                 [
                     "history", "structural_index", "architect", "threat_modeler",
-                    "planner", "researcher", "deduplicator", "reviewer", "reviewer_classifier",
+                    "planner", "researcher", "findings_gate", "deduplicator", "reviewer", "reviewer_classifier",
                     "critic", "critic_classifier", "reproducer", "repro_classifier",
                     "chainer", "patcher", "calibrator", "reflector", "reporter"
                 ],
                 "dynamic_confirmed"
             ),
-            # Script 2: False positive -> reported (suppressed)
+            # Script 2: False positive -> false_positive (suppressed from calibration)
             (
                 [
                     "History extracted.",
-                    "Structural index built.",
                     "Architecture KB created.",
                     "Threat model created.",
                     "Plan created.",
                     "Found potential buffer overflow.",
                     "Findings deduplicated.",
                     json.dumps({"route": "false_positive", "reason": "Input is bounded."}),
-                    "Calibration score: 0",
                     "Learnings reflected.",
                     "Report generated.",
                 ],
                 [
                     "history", "structural_index", "architect", "threat_modeler",
-                    "planner", "researcher", "deduplicator", "reviewer", "reviewer_classifier",
+                    "planner", "researcher", "findings_gate", "deduplicator", "reviewer", "reviewer_classifier",
                     "calibrator", "reflector", "reporter"
                 ],
-                "reported"
+                "false_positive"
             ),
             # Script 3: Repro fails -> calibrator -> static_confirmed
             (
                 [
                     "History extracted.",
-                    "Structural index built.",
                     "Architecture KB created.",
                     "Threat model created.",
                     "Plan created.",
@@ -145,13 +140,12 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
                     json.dumps({"route": "confirmed", "reason": "Analysis done."}),
                     json.dumps({"route": "viable", "reason": "Exploit is viable."}),
                     json.dumps({"route": "failed_repro", "reason": "Exploit attempt failed."}),
-                    "Calibration score: 15",
                     "Learnings reflected.",
                     "Report generated.",
                 ],
                 [
                     "history", "structural_index", "architect", "threat_modeler",
-                    "planner", "researcher", "deduplicator", "reviewer", "reviewer_classifier",
+                    "planner", "researcher", "findings_gate", "deduplicator", "reviewer", "reviewer_classifier",
                     "critic", "critic_classifier", "reproducer", "repro_classifier",
                     "calibrator", "reflector", "reporter"
                 ],
@@ -190,18 +184,27 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
                 await ss.create_session(app_name=APP_NAME, user_id=USER_ID, session_id=sess_id)
                 runner = Runner(app=app, session_service=ss)
 
-                status_map = cfg.get("on_enter_status", {})
+                # P4: on_enter_status is exported empty; completion stamps
+                # fire from after_agent_callback, which resolves the db and
+                # finding through current_run_context.
+                self.assertEqual(cfg.get("on_enter_status"), {})
+                # sandbox_executed models the reproducer having actually run
+                # its PoC: INV-1's gate refuses dynamic_confirmed stamps from
+                # runs that never touched a sandbox.
+                ctx = RunContext(jail_dir=temp_dir, db_path=db_path, target_file=target_file, run_id=run_id, sandbox_executed=True)
+                tok = current_run_context.set(ctx)
                 msg = types.Content(parts=[types.Part.from_text(text="Evaluate file.py")], role="user")
                 executed_nodes = []
-                async for ev in runner.run_async(user_id=USER_ID, session_id=sess_id, new_message=msg):
-                    path = getattr(getattr(ev, "node_info", None), "path", None)
-                    if path:
-                        node_name = path.split("/")[-1].split("@")[0]
-                        if status_map and node_name in status_map:
-                            update_status(db_path, target_file, run_id, status_map[node_name])
-                        if not executed_nodes or executed_nodes[-1] != node_name:
-                            executed_nodes.append(node_name)
-                await runner.close()
+                try:
+                    async for ev in runner.run_async(user_id=USER_ID, session_id=sess_id, new_message=msg):
+                        path = getattr(getattr(ev, "node_info", None), "path", None)
+                        if path:
+                            node_name = path.split("/")[-1].split("@")[0]
+                            if not executed_nodes or executed_nodes[-1] != node_name:
+                                executed_nodes.append(node_name)
+                    await runner.close()
+                finally:
+                    current_run_context.reset(tok)
                 self.assertEqual(executed_nodes, expected_node_order)
 
                 findings = read_findings(db_path, target_file, run_id=run_id)
@@ -2210,7 +2213,11 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
         r2 = LlmResponse(content=types.Content(role="model", parts=[types.Part.from_text(text="I am unable to review this exploit pattern.")]))
         s2 = ResilientLiteLlm._sanitize_structured_response(r2, ReviewVerdict)
         v2 = ReviewVerdict.model_validate_json(s2.content.parts[0].text)
-        self.assertEqual(v2.route, "confirmed")
+        # Fail CLOSED: a safety refusal must never promote to a confirmed
+        # vulnerability. The "Fallback:" prefix is the classifier contract
+        # (synthesized dismissals are routed but never persisted as status).
+        self.assertEqual(v2.route, "false_positive")
+        self.assertTrue(v2.reason.startswith("Fallback:"))
 
         # 3. CriticVerdict refusal fallback
         r3 = LlmResponse(content=types.Content(role="model", parts=[types.Part.from_text(text="I cannot assist with determining viability of attacks.")]))
@@ -2262,6 +2269,13 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
             db_path = os.path.join(temp_dir, "test_domain.db")
             init_db(db_path)
             run_id = "test-domain-run"
+            # The citation verifier only persists findings whose cited files
+            # exist under the jail with the cited lines present, so lay down
+            # the files the findings below cite.
+            os.makedirs(os.path.join(temp_dir, "src"), exist_ok=True)
+            for rel, n_lines in (("src/crypto.py", 100), ("src/api.py", 40), ("app.py", 40)):
+                with open(os.path.join(temp_dir, rel), "w") as fh:
+                    fh.write("\n".join(f"# filler {i}" for i in range(1, n_lines + 1)) + "\n")
             ctx = RunContext(jail_dir=temp_dir, db_path=db_path, target_file="app.py", run_id=run_id)
             tok = current_run_context.set(ctx)
             try:
@@ -2431,16 +2445,20 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
                 })
                 self.assertIn("SUCCESS: Saved 1 finding", res_rf2)
 
-                # 9. get_findings fail-closed and data paths (both run-wide fallback and explicit file filtering)
+                # 9. get_findings campaign scoping and explicit file filtering.
+                # Unscoped reads are scoped to the campaign target (app.py):
+                # in multi-target runs every campaign shares one run_id, and a
+                # run-wide read leaked other campaigns' findings.
                 res_get = get_findings()
                 self.assertIn("SQL Injection A", res_get)
-                self.assertIn("Hardcoded Secret Key", res_get)
-                self.assertIn("Missing Rate Limit", res_get)
+                self.assertNotIn("Hardcoded Secret Key", res_get)
 
-                # Explicitly filtered query for adjacent file
+                # Explicitly filtered queries for adjacent files
                 res_get_crypto = get_findings("src/crypto.py")
                 self.assertIn("Hardcoded Secret Key", res_get_crypto)
                 self.assertNotIn("SQL Injection A", res_get_crypto)
+                res_get_api = get_findings("src/api.py")
+                self.assertIn("Missing Rate Limit", res_get_api)
 
                 # 10. Dual-channel document unshadowing: write_file document vs record_* structured metadata
                 rich_doc = "# Deep Threat Model\n\nFull 3.3KB architectural threat analysis with trust boundaries and STRIDE matrices."
@@ -2823,8 +2841,10 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(wf)
         self.assertEqual(wf_config.get("default_model"), "vertex_ai/gemini-3.7-flash")
         self.assertEqual(wf_config.get("reasoning_effort"), "medium")
-        self.assertEqual(wf_config.get("on_enter_status", {}).get("reproducer"), "static_confirmed")
-        self.assertEqual(wf_config.get("on_enter_status", {}).get("patcher"), "dynamic_confirmed")
+        # P4: on_enter_status is exported empty -- completion stamps moved to
+        # success-only after_agent_callback so a crashed node cannot stamp
+        # findings on entry.
+        self.assertEqual(wf_config.get("on_enter_status"), {})
 
     def test_adk_evaluation_suite_schemas_and_eval_cases(self):
         """Verifies that ADK evaluation dataset and config files adhere to Google ADK EvalSet schema."""
