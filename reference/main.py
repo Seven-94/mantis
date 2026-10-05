@@ -1020,6 +1020,25 @@ async def pipeline(
         pipeline_dir = os.path.realpath(os.path.dirname(__file__))
         workflow_path = os.path.join(pipeline_dir, "workflow.json")
 
+    # The pause banner's resume command must restate this run's one-shot
+    # overrides (they are never persisted): without them a pasted resume
+    # runs against the configured defaults — most dangerously, a different
+    # findings database. Launcher-flag spellings; a dict-shaped sandbox
+    # override has no CLI form and is omitted.
+    banner_resume_flags: dict = {}
+    if db_override:
+        banner_resume_flags["--db"] = db_override
+    if model_override:
+        banner_resume_flags["--model"] = model_override
+    if api_base_override:
+        banner_resume_flags["--api-base"] = api_base_override
+    if sandbox_override and isinstance(sandbox_override, str):
+        banner_resume_flags["--sandbox"] = sandbox_override
+    if timeout_override is not None:
+        banner_resume_flags["--timeout"] = timeout_override
+    if reasoning_effort_override:
+        banner_resume_flags["--reasoning-effort"] = reasoning_effort_override
+
     # Auto-resolve unconfigured placeholders if enabled
     if auto_configure:
         try:
@@ -1961,6 +1980,7 @@ async def pipeline(
                         trigger=be.details,
                         target=str(scan_target),
                         workflow=str(workflow_path),
+                        resume_flags=banner_resume_flags,
                         progress_summary=(
                             f"examined {examined_n} of {planned_n} {scan_mode} target(s) "
                             f"({pct:.1f}%); {planned_n - examined_n} never opened"

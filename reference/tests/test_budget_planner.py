@@ -326,6 +326,46 @@ class TestPauseBannerScopes(unittest.TestCase):
         )
 
 
+class TestResumeCommandCarriesOverrides(unittest.TestCase):
+    """One-shot CLI overrides are never persisted, so the banner's resume
+    command must restate them: a paste that omits --db resumes against the
+    configured default database, not the one this run actually wrote to."""
+
+    def test_overrides_appear_in_resume_command(self):
+        ctrl = BudgetController(config=_quiet_config(), run_id="r_flags")
+        banner = ctrl.format_pause_banner(
+            trigger="token_budget",
+            target="app.py",
+            resume_flags={
+                "--db": "/scratch/campaign one.db",
+                "--model": "vertex_ai/gemini-x",
+                "--timeout": 120.0,
+            },
+        )
+        resume_line = next(l for l in banner.splitlines() if "--resume" in l)
+        self.assertIn("--db '/scratch/campaign one.db'", resume_line)
+        self.assertIn("--model vertex_ai/gemini-x", resume_line)
+        self.assertIn("--timeout 120.0", resume_line)
+
+    def test_hostile_override_value_is_quoted(self):
+        # The banner is a copy-paste executable; a value carrying shell
+        # metacharacters must come out as one inert token.
+        ctrl = BudgetController(config=_quiet_config(), run_id="r_hostile")
+        banner = ctrl.format_pause_banner(
+            trigger="token_budget",
+            resume_flags={"--db": "x.db; rm -rf /"},
+        )
+        resume_line = next(l for l in banner.splitlines() if "--resume" in l)
+        self.assertIn("--db 'x.db; rm -rf /'", resume_line)
+
+    def test_no_overrides_keeps_command_unchanged(self):
+        ctrl = BudgetController(config=_quiet_config(), run_id="r_noflags")
+        banner = ctrl.format_pause_banner(trigger="token_budget")
+        resume_line = next(l for l in banner.splitlines() if "--resume" in l)
+        self.assertNotIn("--db", resume_line)
+        self.assertNotIn("--model", resume_line)
+
+
 class TestUnboundedBudget(unittest.TestCase):
     """--no-budget: a ceiling of 0 disables that dimension, and ONLY that dimension.
 

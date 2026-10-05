@@ -404,6 +404,7 @@ class BudgetController:
         saved_recipe_path: str = "",
         target: str = "",
         workflow: str = "",
+        resume_flags: "dict | None" = None,
     ) -> str:
         """Formats a clear, human-readable terminal pause banner with resume instructions."""
         token_limit = f"{self.config.max_tokens:,} limit" if self.config.max_tokens > 0 else "unlimited"
@@ -478,6 +479,14 @@ class BudgetController:
             parts.append(f"--max-llm-calls {self.config.max_llm_calls * 2}")
         if self.config.max_node_tool_calls > 0:
             parts.append(f"--max-node-tool-calls {self.config.max_node_tool_calls * 2}")
+        # One-shot CLI overrides (--db, --model, ...) are deliberately NOT
+        # persisted to workflow.local.json, so the resume command must carry
+        # them itself: a paste that omits --db resumes against the configured
+        # default database, not the one this run actually wrote to. Values
+        # ride in from the operator's command line but pass through config
+        # handling, so they are quoted like every other token.
+        for flag, value in (resume_flags or {}).items():
+            parts.append(f"{flag} {shlex.quote(str(value))}")
         if workflow:
             parts.append(f"--workflow {shlex.quote(str(Path(workflow).resolve()))}")
         resume_cmd = " ".join(parts)
