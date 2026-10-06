@@ -218,6 +218,20 @@ def _node_name(node) -> str:
         return ""
 
 
+# Ambient runtime/stdlib objects whose methods (console.log, JSON.parse, os.open)
+# must not resolve as 'direct' call edges to an unrelated repository symbol
+# merely because no local 'console' or 'JSON' class exists in the catalog.
+_AMBIENT_RECEIVERS = frozenset({
+    "console", "Math", "JSON", "Object", "Array", "Promise", "Number",
+    "String", "Boolean", "Date", "RegExp", "Error", "Map", "Set", "WeakMap",
+    "WeakSet", "Symbol", "Reflect", "Proxy", "Intl", "Buffer", "process",
+    "window", "document", "localStorage", "sessionStorage", "navigator",
+    "os", "sys", "re", "json", "time", "math", "logging", "pathlib", "shutil",
+    "subprocess", "sqlite3", "hashlib", "uuid", "itertools", "functools",
+    "collections", "typing", "asyncio", "threading", "tempfile", "unittest",
+})
+
+
 def _rightmost_name_leaf(node) -> str:
     """The called name inside a callee expression: a.b.c() calls 'c'."""
     best = ""
@@ -233,16 +247,49 @@ def _rightmost_name_leaf(node) -> str:
     return best
 
 
-def _callee_name(call_node) -> str:
+def _target_qualifier(target) -> str:
+    """Immediate static receiver of a member/qualified call target, else ''."""
+    if target is None or target.type in _NAME_LEAF_TYPES:
+        return ""
+    children = target.named_children
+    if len(children) < 2:
+        return ""
+    recv = children[0]
+    prop = children[-1]
+    if prop.type not in _NAME_LEAF_TYPES:
+        return ""
+    if recv.type in _CALL_TYPES or "subscript" in recv.type or "index" in recv.type:
+        return ""
+    if recv.type in _NAME_LEAF_TYPES or recv.type in ("self", "this", "super"):
+        try:
+            return recv.text.decode("utf-8", errors="replace").strip()
+        except Exception:
+            return ""
+    # Chained member access (`models.sequelize.query`): take the immediate
+    # receiver (`sequelize`) when the left spine is itself a member access.
+    if len(recv.named_children) >= 2 and recv.named_children[-1].type in _NAME_LEAF_TYPES:
+        try:
+            return recv.named_children[-1].text.decode("utf-8", errors="replace").strip()
+        except Exception:
+            return ""
+    return ""
+
+
+def _callee_parts(call_node) -> Tuple[str, str]:
+    """Returns (qualifier, callee_name) for a call AST node."""
     for field in ("function", "name", "constructor", "type", "method"):
         target = call_node.child_by_field_name(field)
         if target is not None:
-            return _rightmost_name_leaf(target)
+            return _target_qualifier(target), _rightmost_name_leaf(target)
     for child in call_node.named_children:
         leaf = _rightmost_name_leaf(child)
         if leaf:
-            return leaf
-    return ""
+            return _target_qualifier(child), leaf
+    return "", ""
+
+
+def _callee_name(call_node) -> str:
+    return _callee_parts(call_node)[1]
 
 
 def _signature_of(node, source: bytes) -> str:
@@ -314,15 +361,18 @@ def extract_unit(rel_path: str, source: bytes, language: str, parser) -> Dict[st
                 })
                 enclosing = enclosing + [(name, sid)]
         elif node.type in _CALL_TYPES:
-            callee = _callee_name(node)
+            qualifier, callee = _callee_parts(node)
             if callee:
                 caller_id = enclosing[-1][1] if enclosing else module_id
-                edges.append({
+                edge_entry: Dict[str, Any] = {
                     "caller_id": caller_id,
                     "callee_name": callee,
                     "file_path": rel_path,
                     "line": node.start_point[0] + 1,
-                })
+                }
+                if qualifier:
+                    edge_entry["qualifier"] = qualifier
+                edges.append(edge_entry)
         for child in reversed(node.named_children):
             stack.append((child, enclosing))
 
@@ -626,6 +676,67 @@ def _build(code_root: str, state: Path, snapshot_id: str, t0: float) -> Dict[str
     return manifest
 
 
+def _resolve_callee_id(
+    edge: Dict[str, Any],
+    syms_by_name: Dict[str, List[Dict[str, Any]]],
+    sym_by_id: Dict[str, Dict[str, Any]],
+) -> Optional[str]:
+    """Resolves a call edge to a unique catalog symbol_id, else None (unresolved).
+
+    A bare call (`helper()`) is 'direct' only when the name is unique across
+    the catalog. A qualified call (`UserModel.findAll()`, `auth.login()`,
+    `self.refresh()`) uses the receiver both positively -- to disambiguate
+    between same-named methods/functions when the receiver names the owning
+    class or module -- and negatively, refusing to link a PascalCase class/model
+    receiver (`UserModel.findAll`) or an ambient runtime object (`console.log`)
+    to an unrelated class's method (`RecycleComponent.findAll`).
+    """
+    callee_name = edge.get("callee_name") or ""
+    candidates = syms_by_name.get(callee_name, [])
+    if not candidates:
+        return None
+    qual = (edge.get("qualifier") or "").strip()
+    if not qual:
+        return candidates[0]["symbol_id"] if len(candidates) == 1 else None
+
+    if qual in ("self", "this", "super", "cls"):
+        caller_sym = sym_by_id.get(edge.get("caller_id") or "")
+        caller_q = (caller_sym or {}).get("qualified_name") or ""
+        if "." in caller_q:
+            caller_owner = caller_q.rsplit(".", 1)[0]
+            same_owner = [
+                c for c in candidates
+                if c.get("qualified_name") == f"{caller_owner}.{callee_name}"
+            ]
+            if len(same_owner) == 1:
+                return same_owner[0]["symbol_id"]
+        return candidates[0]["symbol_id"] if len(candidates) == 1 else None
+
+    # Explicit receiver (`Session.refresh`, `auth.login`, `UserModel.findAll`).
+    suffix = f"{qual}.{callee_name}"
+    matched = [
+        c for c in candidates
+        if c.get("qualified_name") == suffix
+        or str(c.get("qualified_name") or "").endswith("." + suffix)
+        or Path(str(c.get("file_path") or "")).stem == qual
+    ]
+    if len(matched) == 1:
+        return matched[0]["symbol_id"]
+    if len(matched) > 1:
+        return None
+
+    # No candidate matched the qualifier. Refuse known ambient/stdlib objects
+    # (`console.log`, `json.loads`) and PascalCase class/model receivers calling
+    # a method owned by a different class (`UserModel.findAll` vs
+    # `RecycleComponent.findAll`); lowercase instance variables (`s.refresh()`)
+    # still resolve when the method name itself is unique in the catalog.
+    if qual in _AMBIENT_RECEIVERS or qual[0].isupper():
+        return None
+    if len(candidates) == 1:
+        return candidates[0]["symbol_id"]
+    return None
+
+
 def _write_catalog(state: Path, units: List[Dict[str, Any]], coverage_rows, snapshot_id: str) -> None:
     """Writes catalog.sqlite via tmp + atomic replace."""
     tmp_path = state / "tmp" / "catalog.sqlite.tmp"
@@ -639,13 +750,12 @@ def _write_catalog(state: Path, units: List[Dict[str, Any]], coverage_rows, snap
         conn.execute("INSERT OR REPLACE INTO schema_meta VALUES ('schema_version', ?)", (str(SCHEMA_VERSION),))
         conn.execute("INSERT OR REPLACE INTO schema_meta VALUES ('snapshot_id', ?)", (snapshot_id,))
 
-        # Name -> ids map for callee resolution. A name is 'direct' only when
-        # it is unambiguous across the whole catalog; everything else stays
-        # 'unresolved' rather than guessing.
-        ids_by_name: Dict[str, List[str]] = {}
+        syms_by_name: Dict[str, List[Dict[str, Any]]] = {}
+        sym_by_id: Dict[str, Dict[str, Any]] = {}
         for unit in units:
             for sym in unit["symbols"]:
-                ids_by_name.setdefault(sym["name"], []).append(sym["symbol_id"])
+                syms_by_name.setdefault(sym["name"], []).append(sym)
+                sym_by_id[sym["symbol_id"]] = sym
 
         for unit in units:
             for sym in unit["symbols"]:
@@ -664,8 +774,7 @@ def _write_catalog(state: Path, units: List[Dict[str, Any]], coverage_rows, snap
                          sym["end_line"], sym["signature"], sym["language"]),
                     )
             for edge in unit["edges"]:
-                candidates = ids_by_name.get(edge["callee_name"], [])
-                callee_id = candidates[0] if len(candidates) == 1 else None
+                callee_id = _resolve_callee_id(edge, syms_by_name, sym_by_id)
                 conn.execute(
                     "INSERT INTO call_edges (caller_id, callee_id, callee_name, file_path, line, edge_kind)"
                     " VALUES (?, ?, ?, ?, ?, ?)",

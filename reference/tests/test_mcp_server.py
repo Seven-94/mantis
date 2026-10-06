@@ -215,7 +215,8 @@ class TestGateVerdicts(unittest.TestCase):
         self.assertTrue(record_spend(
             self.state.db_path, "run-t", str(self.repo), "deep", tokens=10))
 
-    def _write_finding(self, severity: str, status: str = "", filepath: str = "app.py"):
+    def _write_finding(self, severity: str, status: str = "", filepath: str = "app.py",
+                       line_numbers=None):
         write_findings(
             self.state.db_path,
             str(self.repo / filepath),
@@ -224,7 +225,7 @@ class TestGateVerdicts(unittest.TestCase):
                 "description": "test finding",
                 "severity": severity,
                 "filepath": filepath,
-                "line_numbers": [2],
+                "line_numbers": [2] if line_numbers is None else line_numbers,
             }],
             run_id="run-t",
             status=status,
@@ -240,6 +241,21 @@ class TestGateVerdicts(unittest.TestCase):
         out = mcp_server.check_change(self.state, diff=DIFF_IN_HELPER)
         self.assertEqual(out["verdict"], "BLOCK")
         self.assertEqual(out["findings"][0]["relationship"], "direct")
+
+    def test_unrelated_finding_in_same_file_reviews_not_blocks(self):
+        # A HIGH finding at line 20 (outside helper's 1..2 extent and past
+        # the diff hunk proximity window) is pre-existing file debt: the gate
+        # surfaces it at REVIEW as "unrelated_in_file" rather than BLOCKing an
+        # edit to helper(). When no diff lines are given (files=["app.py"]),
+        # the gate fails closed to BLOCK.
+        self._write_finding("HIGH", line_numbers=[20])
+        out = mcp_server.check_change(self.state, diff=DIFF_IN_HELPER)
+        self.assertEqual(out["verdict"], "REVIEW", out["reasons"])
+        self.assertEqual(out["findings"][0]["relationship"], "unrelated_in_file")
+
+        out_file_only = mcp_server.check_change(self.state, files=["app.py"])
+        self.assertEqual(out_file_only["verdict"], "BLOCK")
+        self.assertEqual(out_file_only["findings"][0]["relationship"], "direct")
 
     def test_review_on_open_medium(self):
         self._write_finding("MEDIUM")
@@ -519,6 +535,22 @@ class TestScanStatusLabels(unittest.TestCase):
     def test_other_nonzero_exits_are_errors(self):
         status = self._scan_with_exit(1)
         self.assertEqual(status.get("status"), "finished_with_errors", status)
+
+    def test_wait_seconds_blocks_until_scan_completes(self):
+        from unittest import mock
+
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        repo = make_repo(tmp)
+        state = mcp_server.MantisState(str(repo))
+        mcp_server.reindex(state)
+        with mock.patch.object(
+                mcp_server, "_scan_cmd",
+                lambda *a, **k: [sys.executable, "-c",
+                                 "import time; time.sleep(0.1)"]):
+            out = mcp_server.scan_change(state, ["app.py"])
+            status = mcp_server.scan_status(state, out["scan_id"], wait_seconds=10)
+        self.assertEqual(status.get("status"), "done", status)
 
 
 class TestCheckCli(unittest.TestCase):

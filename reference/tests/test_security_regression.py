@@ -2277,9 +2277,6 @@ class TestSecondRoundAuditRegressions(unittest.TestCase):
                          f"POSIX sh did not anchor the relative target (stderr: {proc.stderr})")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 class TestThirdRoundAuditRegressions(unittest.TestCase):
     """Round-3 audit findings.
 
@@ -7324,6 +7321,55 @@ class TestFindingsFromDifferentSlicesAreJoined(unittest.TestCase):
                 return
         self.fail("no correlate() call found in pipeline")
 
+    def test_call_graph_edge_correlates_caller_and_callee_findings(self):
+        """Two findings in different files that name neither the same symbol nor
+        the same CWE are still correlated when the structural index shows one's
+        enclosing function directly calls the other's."""
+        from core.correlator import LINK_CALL_GRAPH, correlate
+        from core.structural_index import build_structural_index, state_dir_for_db
+
+        tmp = tempfile.mkdtemp(prefix="mantis_corr_cg_")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        repo = Path(tmp) / "repo"
+        (repo / "routes").mkdir(parents=True)
+        (repo / "workers").mkdir(parents=True)
+        (repo / "routes" / "dispatch.py").write_text(
+            "def dispatch_order(req):\n"
+            "    return reconcile_shipment(req)\n",
+            encoding="utf-8",
+        )
+        (repo / "workers" / "reconcile.py").write_text(
+            "def reconcile_shipment(payload):\n"
+            "    return payload\n",
+            encoding="utf-8",
+        )
+        db = str(Path(tmp) / "k.db")
+        Path(db).touch()
+        build_structural_index(str(repo), state_dir_for_db(db), "snap_cg")
+
+        f_caller = {
+            "id": "1",
+            "filepath": "routes/dispatch.py",
+            "line_numbers": [2],
+            "cwe": "CWE-20",
+            "code_paths": [],
+            "title": "unvalidated order dispatch",
+        }
+        f_callee = {
+            "id": "2",
+            "filepath": "workers/reconcile.py",
+            "line_numbers": [2],
+            "cwe": "CWE-78",
+            "code_paths": [],
+            "title": "unsanitized worker command",
+        }
+        out = correlate([f_caller, f_callee], db_path=db)
+        self.assertTrue(out.get("available"), out)
+        cg_groups = [g for g in out["groups"] if g["kind"] == LINK_CALL_GRAPH]
+        self.assertEqual(len(cg_groups), 1, out["groups"])
+        self.assertEqual(cg_groups[0]["key"], "dispatch_order -> reconcile_shipment")
+        self.assertEqual(cg_groups[0]["members"], ["1", "2"])
+
 
 class TestLeadsFromOneAreaReachAnother(unittest.TestCase):
     """M-4. A confirmed defect in one area is a reason to look for its shape in the
@@ -7525,6 +7571,48 @@ class TestLeadsFromOneAreaReachAnother(unittest.TestCase):
             "generate_hypotheses", called,
             "pipeline never generates hypotheses; leads never cross areas.",
         )
+
+    def test_hypotheses_prioritize_and_name_verified_call_sites(self):
+        """When the structural index is available, a confirmed symbol from
+        another slice that is actually called inside `scan_item` ranks ahead of
+        uncalled symbols and names the concrete call site in `rationale`, while
+        preserving the strict 4-key lead contract."""
+        from core.correlator import generate_hypotheses
+        from core.structural_index import build_structural_index, state_dir_for_db
+
+        tmp = tempfile.mkdtemp(prefix="mantis_hyp_cg_")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        repo = Path(tmp) / "repo"
+        (repo / "svc" / "auth").mkdir(parents=True)
+        (repo / "svc" / "api").mkdir(parents=True)
+        (repo / "svc" / "auth" / "token.py").write_text(
+            "def alpha_unused(x):\n"
+            "    return x\n\n"
+            "def parse_token(raw):\n"
+            "    return raw\n",
+            encoding="utf-8",
+        )
+        (repo / "svc" / "api" / "orders.py").write_text(
+            "def create_order(req):\n"
+            "    return parse_token(req)\n",
+            encoding="utf-8",
+        )
+        db = str(Path(tmp) / "k.db")
+        Path(db).touch()
+        build_structural_index(str(repo), state_dir_for_db(db), "snap_hyp")
+
+        leads = generate_hypotheses(
+            self._memory([
+                self._entry("svc/auth/token.py", symbols=["alpha_unused"]),
+                self._entry("svc/auth/token.py", symbols=["parse_token"]),
+            ]),
+            str(repo / "svc" / "api"),
+            db_path=db,
+        )
+        self.assertEqual([h["subject"] for h in leads], ["parse_token", "alpha_unused"])
+        self.assertIn("svc/api/orders.py:2", leads[0]["rationale"])
+        for lead in leads:
+            self.assertEqual(set(lead.keys()), {"kind", "subject", "rationale", "source"})
 
 
 class TestARunDescribesItsOwnShape(unittest.TestCase):
@@ -10137,3 +10225,7 @@ class TestPathRootCanonicalization(unittest.TestCase):
         """relpath would happily fabricate ../../etc/passwd; the candidate
         loop must reject the escape and fall through unchanged."""
         self.assertEqual(self._canon("/etc/passwd"), "/etc/passwd")
+
+
+if __name__ == "__main__":
+    unittest.main()

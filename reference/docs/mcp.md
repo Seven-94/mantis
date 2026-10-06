@@ -89,11 +89,15 @@ claude mcp add mantis -- /opt/mantis/reference/.venv/bin/python \
 
 `mantis_check_change` returns one of three verdicts:
 
-- **BLOCK** — an open HIGH or CRITICAL finding sits in a changed file. Fix it,
-  or mark it `false_positive` with evidence, before merging.
+- **BLOCK** — an open HIGH or CRITICAL finding intersects the changed hunks or a
+  modified function in a changed file (`relationship: "direct"`). Fix it, or
+  mark it `false_positive` with evidence, before merging.
 - **REVIEW** — something demands attention: open findings of any severity touch
-  the change or its direct callers, a changed file has never been covered by any
-  recorded scan, or the index/database needed to decide is missing.
+  the change, sit elsewhere in a changed file outside the modified
+  lines/functions (`relationship: "unrelated_in_file"`, pre-existing file debt),
+  or sit in a direct caller (`relationship: "caller_radius"`); a changed file
+  has never been covered by any recorded scan; or the index/database needed to
+  decide is missing.
 - **PASS** — every check ran and nothing known intersects the change.
 
 Two properties are deliberate and load-bearing:
@@ -147,7 +151,8 @@ server never lets an operator claim them.
 
 ## Scan lifecycle
 
-`mantis_scan_status` reports `running`, then one of: `done` (all files clean
+`mantis_scan_status` (pass `wait_seconds`, up to `60`, to long-poll instead of
+spinning on turns) reports `running`, then one of: `done` (all files clean
 exit), `paused_at_budget` (the pipeline hit its LLM-call budget and paused
 gracefully — findings written so far are already in the database and the run is
 resumable), or `finished_with_errors`. The record also carries `index_restored`:

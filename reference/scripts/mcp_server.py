@@ -64,6 +64,13 @@ BLOCKING_SEVERITIES = {"CRITICAL", "HIGH"}
 # stays readable.
 MAX_CALLERS_SHOWN = 10
 
+# Maximum server-side wait for mantis_scan_status long-polling, so an MCP
+# client can block on a running scan without burning agent turns in a poll loop.
+MAX_WAIT_SECONDS = 60.0
+
+# Line proximity window around a diff hunk for findings outside any function.
+DIFF_LINE_PROXIMITY = 3
+
 VERDICT_PASS = "PASS"
 VERDICT_REVIEW = "REVIEW"
 VERDICT_BLOCK = "BLOCK"
@@ -79,6 +86,7 @@ class MantisState:
         self.home = self.repo / ".mantis"
         self.db_path = str(self.home / "knowledge.db")
         self.scans: Dict[str, Dict[str, Any]] = {}
+        self._scan_events: Dict[str, threading.Event] = {}
         self._lock = threading.Lock()
 
     def ensure_home(self) -> None:
@@ -510,22 +518,68 @@ def check_change(state: MantisState, files: Optional[List[str]] = None,
             if str(f.get("status") or "").lower() not in OPEN_FINDING_STATUSES:
                 continue
             f_fp = str(f.get("filepath") or "")
-            direct = any(_finding_matches(state, f_fp, c) for c in changed)
-            in_radius = not direct and any(_finding_matches(state, f_fp, r) for r in radius_files)
-            if not direct and not in_radius:
+            matched_files = [c for c in changed if _finding_matches(state, f_fp, c)]
+            in_file = bool(matched_files)
+            in_radius = not in_file and any(_finding_matches(state, f_fp, r) for r in radius_files)
+            if not in_file and not in_radius:
                 continue
+
+            # When a diff gives changed line numbers and the finding records its
+            # own lines, distinguish findings that intersect the modified
+            # hunk/function ("direct", which BLOCKs on HIGH/CRITICAL) from
+            # pre-existing file debt elsewhere in the same file
+            # ("unrelated_in_file", which raises REVIEW instead of BLOCK so a
+            # two-line registration in a legacy router does not block on eight
+            # unrelated findings 400 lines away). Missing line info on either
+            # side fails closed to "direct".
+            direct = False
+            if in_file:
+                diff_lines = sorted({
+                    ln for c in matched_files for ln in (changed.get(c) or [])
+                })
+                f_lines = [
+                    int(x) for x in (f.get("line_numbers") or [])
+                    if isinstance(x, int) and not isinstance(x, bool)
+                ]
+                if not diff_lines or not f_lines:
+                    direct = True
+                elif any(abs(fl - cl) <= DIFF_LINE_PROXIMITY
+                         for fl in f_lines for cl in diff_lines):
+                    direct = True
+                else:
+                    for b in blast:
+                        b_file = str(b.get("file") or "")
+                        b_start = b.get("start_line")
+                        b_end = b.get("end_line")
+                        if (isinstance(b_start, int) and isinstance(b_end, int)
+                                and any(_finding_matches(state, b_file, c) for c in matched_files)
+                                and any(b_start <= fl <= b_end for fl in f_lines)):
+                            direct = True
+                            break
+
             view = _finding_view(f)
-            view["relationship"] = "direct" if direct else "caller_radius"
+            if direct:
+                view["relationship"] = "direct"
+            elif in_file:
+                view["relationship"] = "unrelated_in_file"
+            else:
+                view["relationship"] = "caller_radius"
             hits.append(view)
             sev = str(f.get("severity") or f.get("priority") or "").upper()
             if direct and sev in BLOCKING_SEVERITIES:
                 raise_to(VERDICT_BLOCK,
                          f"Open {sev} finding '{f.get('title')}' touches changed file {f_fp}.",
                          "Fix the finding (or mark it false_positive with evidence) before merging.")
+            elif in_file:
+                raise_to(VERDICT_REVIEW,
+                         f"Open finding '{f.get('title')}' ({sev or 'unrated'}) in the "
+                         f"{'change' if direct else f'same file (outside changed lines): {f_fp}'}"
+                         + (f": {f_fp}." if direct else "."),
+                         "Review the listed findings against this change.")
             else:
                 raise_to(VERDICT_REVIEW,
                          f"Open finding '{f.get('title')}' ({sev or 'unrated'}) in the "
-                         f"{'change' if direct else 'caller radius'}: {f_fp}.",
+                         f"caller radius: {f_fp}.",
                          "Review the listed findings against this change.")
 
         # Coverage: a changed file no scan ever recorded is unknown ground.
@@ -593,6 +647,7 @@ def scan_change(state: MantisState, files: List[str],
     scans_dir.mkdir(exist_ok=True)
     scan_id = uuid.uuid4().hex[:12]
     log_path = scans_dir / f"{scan_id}.log"
+    done_event = threading.Event()
     record = {
         "scan_id": scan_id,
         "files": rels,
@@ -603,59 +658,75 @@ def scan_change(state: MantisState, files: List[str],
     }
     with state._lock:
         state.scans[scan_id] = record
+        state._scan_events[scan_id] = done_event
 
     def _run() -> None:
-        with open(log_path, "ab") as log:
-            for rel_fp in rels:
-                cmd = _scan_cmd(state, str(state.repo / rel_fp), max_llm_calls, model)
-                log.write(f"\n=== mantis scan {rel_fp} ===\n".encode())
-                log.flush()
+        index_restored = False
+        try:
+            with open(log_path, "ab") as log:
+                for rel_fp in rels:
+                    cmd = _scan_cmd(state, str(state.repo / rel_fp), max_llm_calls, model)
+                    log.write(f"\n=== mantis scan {rel_fp} ===\n".encode())
+                    log.flush()
+                    try:
+                        proc = subprocess.run(cmd, stdout=log, stderr=log, cwd=str(_REF_ROOT))
+                        code = proc.returncode
+                    except Exception as exc:  # the loop must survive one bad file
+                        log.write(f"[mcp] scan failed to launch: {exc!r}\n".encode())
+                        code = -1
+                    with state._lock:
+                        record["returncodes"].append(code)
+                # The pipeline just rebuilt the shared catalog rooted at the
+                # scanned FILE, so repo-rooted paths stopped resolving and the
+                # gate's blast radius went blind (found against Juice Shop:
+                # callers vanished after the first scan). Restore the repo-rooted
+                # index before the record flips to done, so a poller that sees
+                # "done" never sees the clobbered catalog.
                 try:
-                    proc = subprocess.run(cmd, stdout=log, stderr=log, cwd=str(_REF_ROOT))
-                    code = proc.returncode
-                except Exception as exc:  # the loop must survive one bad file
-                    log.write(f"[mcp] scan failed to launch: {exc!r}\n".encode())
-                    code = -1
-                with state._lock:
-                    record["returncodes"].append(code)
-            # The pipeline just rebuilt the shared catalog rooted at the
-            # scanned FILE, so repo-rooted paths stopped resolving and the
-            # gate's blast radius went blind (found against Juice Shop:
-            # callers vanished after the first scan). Restore the repo-rooted
-            # index before the record flips to done, so a poller that sees
-            # "done" never sees the clobbered catalog.
-            try:
-                result = reindex(state)
-                index_restored = result.get("status") in ("complete", "partial")
-            except Exception as exc:
-                log.write(f"[mcp] reindex after scan failed: {exc!r}\n".encode())
-                index_restored = False
-        with state._lock:
-            record["index_restored"] = index_restored
-            codes = record["returncodes"]
-            if all(c == 0 for c in codes):
-                record["status"] = "done"
-            elif all(c in (0, 2) for c in codes):
-                # The pipeline exits 2 on a graceful budget pause (findings so
-                # far are already in the database; the run is resumable with
-                # --resume). It is not a failure, so do not label it as one.
-                record["status"] = "paused_at_budget"
-            else:
-                record["status"] = "finished_with_errors"
-            record["ended"] = time.time()
+                    result = reindex(state)
+                    index_restored = result.get("status") in ("complete", "partial")
+                except Exception as exc:
+                    log.write(f"[mcp] reindex after scan failed: {exc!r}\n".encode())
+                    index_restored = False
+        finally:
+            with state._lock:
+                record["index_restored"] = index_restored
+                codes = record["returncodes"]
+                if codes and all(c == 0 for c in codes):
+                    record["status"] = "done"
+                elif codes and all(c in (0, 2) for c in codes):
+                    # The pipeline exits 2 on a graceful budget pause (findings so
+                    # far are already in the database; the run is resumable with
+                    # --resume). It is not a failure, so do not label it as one.
+                    record["status"] = "paused_at_budget"
+                else:
+                    record["status"] = "finished_with_errors"
+                record["ended"] = time.time()
+                done_event.set()
 
     threading.Thread(target=_run, name=f"mantis-scan-{scan_id}", daemon=True).start()
     return {"scan_id": scan_id, "files": rels, "log": str(log_path),
-            "hint": "Poll mantis_scan_status; findings land in the shared database "
-                    "and the next mantis_check_change will see them."}
+            "hint": "Poll mantis_scan_status (pass wait_seconds to block); "
+                    "findings land in the shared database and the next "
+                    "mantis_check_change will see them."}
 
 
-def scan_status(state: MantisState, scan_id: str) -> Dict[str, Any]:
+def scan_status(state: MantisState, scan_id: str,
+                wait_seconds: float = 0) -> Dict[str, Any]:
     with state._lock:
         record = dict(state.scans.get(scan_id) or {})
+        done_event = state._scan_events.get(scan_id)
     if not record:
         return {"error": f"Unknown scan_id '{scan_id}' (scans do not survive server restarts; "
                          "findings they wrote do)."}
+    try:
+        wait_s = min(max(0.0, float(wait_seconds or 0)), MAX_WAIT_SECONDS)
+    except (TypeError, ValueError):
+        wait_s = 0.0
+    if wait_s > 0 and record.get("status") == "running" and done_event is not None:
+        done_event.wait(timeout=wait_s)
+        with state._lock:
+            record = dict(state.scans.get(scan_id) or {})
     out = dict(record)
     if state.db_exists():
         from core.database import read_findings
@@ -710,9 +781,11 @@ def build_server(state: MantisState):
         return scan_change(state, files, max_llm_calls=max_llm_calls, model=model)
 
     @srv.tool()
-    def mantis_scan_status(scan_id: str) -> dict:
-        """Status of a background scan started by mantis_scan_change."""
-        return scan_status(state, scan_id)
+    def mantis_scan_status(scan_id: str, wait_seconds: int = 0) -> dict:
+        """Status of a background scan started by mantis_scan_change. Pass
+        wait_seconds (up to 60) to block until the scan finishes or the timeout
+        elapses instead of polling in a tight loop."""
+        return scan_status(state, scan_id, wait_seconds=wait_seconds)
 
     @srv.tool()
     def mantis_reindex() -> dict:

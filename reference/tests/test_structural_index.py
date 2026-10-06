@@ -190,6 +190,48 @@ class BuildTest(unittest.TestCase):
         self.assertIn("app/db.py", files)
         self.assertIn("lib/util.js", files)
 
+    def test_qualified_call_does_not_misresolve_to_unrelated_class_method(self):
+        # Dogfood regression: routes/login.ts calls `UserModel.findAll(...)` and
+        # `console.log(...)`, while the only `findAll` and `log` definitions in
+        # the catalog belong to `RecycleComponent` and `AuditLogger`. Neither
+        # call may resolve as a 'direct' edge to the unrelated class.
+        (self.code / "app" / "components.py").write_text(
+            "class RecycleComponent:\n"
+            "    def findAll(self):\n"
+            "        return []\n\n"
+            "class AuditLogger:\n"
+            "    def log(self, msg):\n"
+            "        return msg\n\n"
+            "def route_login():\n"
+            "    console.log('hi')\n"
+            "    return UserModel.findAll()\n"
+        )
+        build_structural_index(str(self.code), str(self.state), "snap_qual1")
+        idx = StructuralIndex(str(self.state))
+        route = idx.resolve_symbol("route_login")["results"][0]
+        callees = {
+            e["callee_name"]: e["edge_kind"]
+            for e in idx.find_callees(route)["results"]
+        }
+        self.assertEqual(callees.get("findAll"), "unresolved", callees)
+        self.assertEqual(callees.get("log"), "unresolved", callees)
+
+    def test_qualified_call_disambiguates_same_named_methods(self):
+        (self.code / "app" / "tokens.py").write_text(
+            "class Token:\n"
+            "    def refresh(self):\n"
+            "        return 't'\n\n"
+            "def rotate():\n"
+            "    return Session.refresh()\n"
+        )
+        build_structural_index(str(self.code), str(self.state), "snap_qual2")
+        idx = StructuralIndex(str(self.state))
+        rotate = idx.resolve_symbol("rotate")["results"][0]
+        edges = idx.find_callees(rotate)["results"]
+        self.assertEqual(len(edges), 1, edges)
+        self.assertEqual(edges[0]["edge_kind"], "direct", edges)
+        self.assertEqual(edges[0]["callee"], "Session.refresh", edges)
+
     def test_snapshot_match_reuses_published_index(self):
         build_structural_index(str(self.code), str(self.state), "snap1")
         res2 = build_structural_index(str(self.code), str(self.state), "snap1")

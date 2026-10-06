@@ -65,12 +65,14 @@ _MAX_MEMBERS_SHOWN = 6
 _MAX_PROSE = 160
 
 # Link kinds, strongest first. The order is the published contract: a symbol link is
-# evidence about one piece of code, while a shared CWE is evidence about a habit.
+# evidence about one piece of code, a call-graph edge is a direct AST call between
+# two findings' functions, and a shared CWE is evidence about a habit.
 LINK_SYMBOL = "shared_symbol"
+LINK_CALL_GRAPH = "call_graph_edge"
 LINK_FILE = "shared_file"
 LINK_WEAKNESS = "shared_weakness"
 
-_LINK_ORDER: Tuple[str, ...] = (LINK_SYMBOL, LINK_FILE, LINK_WEAKNESS)
+_LINK_ORDER: Tuple[str, ...] = (LINK_SYMBOL, LINK_CALL_GRAPH, LINK_FILE, LINK_WEAKNESS)
 _LINK_RANK = {name: i for i, name in enumerate(_LINK_ORDER)}
 
 # Operator-authored. The correlator selects which applies; it never writes the text.
@@ -80,6 +82,11 @@ _LINK_NOTE = {
         "establishes that the symbol misbehaves and another assumes it does not, the "
         "composite is worse than either alone -- check whether the assumption in one "
         "is the defect in the other."
+    ),
+    LINK_CALL_GRAPH: (
+        "One of these findings sits in a function that calls into the other in the "
+        "structural index. Check whether untrusted data or a broken invariant "
+        "crosses that call edge."
     ),
     LINK_FILE: (
         "These findings are in the same file. Consider whether they share a root cause, "
@@ -108,6 +115,57 @@ _CODE_EXT_RE = re.compile(r"\.[A-Za-z0-9]{1,6}$")
 def _clip(text: Any, limit: int = _MAX_PROSE) -> str:
     s = str(text or "").strip()
     return s if len(s) <= limit else s[:limit] + " [...]"
+
+
+def _load_structural_index(db_path: str = ""):
+    """Loads the structural index adjacent to db_path (or current_run_context), else None."""
+    try:
+        target_db = str(db_path or "").strip()
+        if not target_db:
+            from core.context import current_run_context
+
+            ctx = current_run_context.get()
+            if ctx and getattr(ctx, "db_path", None):
+                target_db = str(ctx.db_path).strip()
+        if not target_db:
+            return None
+        from core.structural_index import StructuralIndex, state_dir_for_db
+
+        idx = StructuralIndex(state_dir_for_db(target_db))
+        return idx if idx.available() else None
+    except Exception:
+        return None
+
+
+def _enclosing_symbols_for_row(idx: Any, row: Dict[str, Any]) -> set:
+    """Enclosing catalog symbol leaf names for a finding's filepath and line_numbers."""
+    out: set = set()
+    if idx is None:
+        return out
+    try:
+        path = str(row.get("filepath") or "").strip()
+        if not path:
+            return out
+        raw_lines = row.get("line_numbers")
+        if isinstance(raw_lines, str):
+            import json
+
+            raw_lines = json.loads(raw_lines)
+        if not isinstance(raw_lines, (list, tuple)):
+            return out
+        for ln in raw_lines[:5]:
+            if isinstance(ln, int) and not isinstance(ln, bool) and ln > 0:
+                enc = idx.enclosing_symbol(path, ln)
+                if enc.get("found"):
+                    qname = str(enc.get("qualified_name") or "").strip()
+                    leaf = qname.split(".")[-1] if qname else ""
+                    if (leaf and leaf != "<module>"
+                            and _SYMBOL_RE.fullmatch(leaf)
+                            and leaf.lower() not in _SYMBOL_STOPWORDS):
+                        out.add(leaf)
+    except Exception:
+        pass
+    return out
 
 
 def _symbols_from_code_paths(code_paths: Any) -> set:
@@ -173,7 +231,11 @@ def _finding_key(row: Dict[str, Any], index: int) -> str:
     return f"#{index}"
 
 
-def correlate(findings: List[Dict[str, Any]], max_groups: int = _MAX_GROUPS) -> Dict[str, Any]:
+def correlate(
+    findings: List[Dict[str, Any]],
+    max_groups: int = _MAX_GROUPS,
+    db_path: str = "",
+) -> Dict[str, Any]:
     """Groups findings that appear to concern the same defect.
 
     Returns:
@@ -205,15 +267,22 @@ def correlate(findings: List[Dict[str, Any]], max_groups: int = _MAX_GROUPS) -> 
             # Correlation needs something to correlate. One finding is not a pattern.
             return empty
 
+        idx = _load_structural_index(db_path)
+
         by_symbol: Dict[str, List[str]] = {}
+        by_grounded: Dict[str, List[str]] = {}
         by_file: Dict[str, List[str]] = {}
         by_cwe: Dict[str, List[Tuple[str, str]]] = {}
         detail: Dict[str, Dict[str, Any]] = {}
 
         for key, row in rows:
             detail[key] = row
-            for symbol in _symbols_from_code_paths(row.get("code_paths")):
+            cp_syms = _symbols_from_code_paths(row.get("code_paths"))
+            for symbol in cp_syms:
                 by_symbol.setdefault(symbol, []).append(key)
+                by_grounded.setdefault(symbol, []).append(key)
+            for enc_sym in _enclosing_symbols_for_row(idx, row):
+                by_grounded.setdefault(enc_sym, []).append(key)
 
             path = str(row.get("filepath") or "").strip()
             if path:
@@ -238,6 +307,25 @@ def correlate(findings: List[Dict[str, Any]], max_groups: int = _MAX_GROUPS) -> 
 
         for symbol, keys in by_symbol.items():
             _emit(LINK_SYMBOL, symbol, keys)
+
+        if idx is not None and len(by_grounded) >= 2:
+            seen_edges: set = set()
+            for caller_name in sorted(by_grounded):
+                caller_keys = by_grounded[caller_name]
+                for sym_row in (idx.resolve_symbol(caller_name).get("results") or [])[:5]:
+                    for edge in (idx.find_callees(sym_row).get("results") or []):
+                        callee_name = str(edge.get("callee_name") or "").strip()
+                        if (callee_name and callee_name != caller_name
+                                and callee_name in by_grounded):
+                            edge_key = f"{caller_name} -> {callee_name}"
+                            if edge_key not in seen_edges:
+                                seen_edges.add(edge_key)
+                                _emit(
+                                    LINK_CALL_GRAPH,
+                                    edge_key,
+                                    caller_keys + by_grounded[callee_name],
+                                )
+
         for path, keys in by_file.items():
             _emit(LINK_FILE, path, keys)
         for cwe, pairs in by_cwe.items():
@@ -368,6 +456,7 @@ def generate_hypotheses(
     memory: Optional[Dict[str, Any]],
     scan_item: str,
     max_hypotheses: int = _MAX_HYPOTHESES,
+    db_path: str = "",
 ) -> List[Dict[str, Any]]:
     """Proposes cross-area checks for the agent about to examine `scan_item`.
 
@@ -410,6 +499,8 @@ def generate_hypotheses(
                 probe = probe[:cut]
             return False
 
+        idx = _load_structural_index(db_path)
+
         symbols: Dict[str, Dict[str, Any]] = {}
         weaknesses: Dict[str, Dict[str, Any]] = {}
 
@@ -422,7 +513,10 @@ def generate_hypotheses(
             if _is_here(origin):
                 continue
 
-            for symbol in _symbols_from_code_paths(item.get("code_paths")):
+            item_symbols = set(_symbols_from_code_paths(item.get("code_paths")))
+            if idx is not None:
+                item_symbols |= _enclosing_symbols_for_row(idx, item)
+            for symbol in item_symbols:
                 slot = symbols.setdefault(
                     symbol,
                     {"kind": "symbol_reuse", "subject": symbol, "sources": [], "cwe": ""},
@@ -440,18 +534,45 @@ def generate_hypotheses(
                 if origin and origin not in slot["sources"]:
                     slot["sources"].append(origin)
 
+        if idx is not None:
+            for slot in symbols.values():
+                call_sites: List[str] = []
+                for sym_row in (idx.resolve_symbol(slot["subject"]).get("results") or [])[:5]:
+                    for c_edge in (idx.find_callers(sym_row).get("results") or []):
+                        c_fp = str(c_edge.get("file_path") or "").replace("\\", "/")
+                        c_ln = c_edge.get("line")
+                        if c_fp and _is_here(c_fp):
+                            loc = f"{c_fp}:{c_ln}" if c_ln else c_fp
+                            if loc not in call_sites:
+                                call_sites.append(loc)
+                slot["call_sites"] = call_sites[:3]
+
         out: List[Dict[str, Any]] = []
         # Symbols first: a named function is a far more specific lead than a weakness
         # class, and a bounded list should spend its slots on the specific ones.
-        for slot in sorted(symbols.values(), key=lambda s: (-len(s["sources"]), s["subject"])):
-            out.append({
-                "kind": "symbol_reuse",
-                "subject": slot["subject"],
-                "rationale": (
+        # Symbols with verified call sites inside `scan_item` rank ahead of blind leads.
+        for slot in sorted(
+            symbols.values(),
+            key=lambda s: (-len(s.get("call_sites") or ()), -len(s["sources"]), s["subject"]),
+        ):
+            sites = slot.get("call_sites") or []
+            if sites:
+                rationale = (
+                    f"`{slot['subject']}` was confirmed defective elsewhere in this "
+                    f"repository and is called in this area ({', '.join(sites)}). "
+                    f"Check whether those call sites rely on the behaviour that was "
+                    f"found to be wrong."
+                )
+            else:
+                rationale = (
                     f"`{slot['subject']}` was confirmed defective elsewhere in this "
                     f"repository. If this area calls it, check whether it relies on "
                     f"the behaviour that was found to be wrong."
-                ),
+                )
+            out.append({
+                "kind": "symbol_reuse",
+                "subject": slot["subject"],
+                "rationale": rationale,
                 "source": slot["sources"][:3],
             })
         for slot in sorted(weaknesses.values(), key=lambda s: (-len(s["sources"]), s["subject"])):
